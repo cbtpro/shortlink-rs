@@ -1,0 +1,6 @@
+[registries.crates-io]
+protocol = "sparse"
+index = "https://mirrors.ustc.edu.cn/crates.io-index/"
+
+[net]
+offline = true
