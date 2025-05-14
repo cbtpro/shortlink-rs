@@ -1,8 +1,8 @@
 use actix_web::{get, web, HttpResponse, Responder};
-use redis::{AsyncCommands, Client};
+use redis::Client;
 use sqlx::MySqlPool;
 
-use crate::db::link::get_link_by_code;
+use crate::{cache, db::link::get_link_by_code};
 
 #[get("/{code}")]
 pub async fn redirect_handler(
@@ -11,6 +11,8 @@ pub async fn redirect_handler(
     redis: web::Data<Client>,
 ) -> impl Responder {
     let code = path.into_inner();
+    let redis_key = format!("short:code:{}", &code);
+    println!("Redis key: {}", redis_key);
     let client = redis.clone();
     // 获取异步连接
     let mut redis_conn = match client.get_multiplexed_async_connection().await {
@@ -18,8 +20,7 @@ pub async fn redirect_handler(
         Err(_) => return HttpResponse::InternalServerError().body("Redis unavailable"),
     };
 
-    let redis_key = format!("short:code:{}", &code);
-    if let Ok(cached_url) = redis_conn.get::<_, String>(redis_key).await {
+    if let Ok(Some(cached_url)) = cache::get_cached_url(&mut redis_conn, &redis_key).await {
         println!("Cache hit: {}", cached_url);
         return HttpResponse::Found()
             .append_header(("Location", cached_url))
@@ -32,8 +33,7 @@ pub async fn redirect_handler(
         Ok(Some(url)) => {
             println!("DB hit: {}", url);
             // 写入 Redis 缓存，设置过期时间 1 小时
-            let _: () = redis_conn
-                .set_ex(format!("short:code:{}", code), &url, 3600)
+            let _: () = cache::set_cached_url(&mut redis_conn, &redis_key, &url, 3600)
                 .await
                 .unwrap_or(());
             HttpResponse::Found()
