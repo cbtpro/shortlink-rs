@@ -48,5 +48,5 @@ curl -i http://127.0.0.1:9981/oBNN5a6xa6FQOFJz
 # 获取短链接
 curl -X POST http://127.0.0.1:9981/shorten \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}'
+  -d '{  "url": "http://127.0.0.1:10000/demo/all",  "custom_code": "mycode123",  "expire_at": "2025-12-31T23:59:59",  "max_visits": 100,  "password": "123456",  "ip_limit": { "whitelist": ["1.2.3.4"] },"ua_limit": { "blacklist": ["curl", "wget"]}}'
 ```

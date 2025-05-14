@@ -1,6 +1,6 @@
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::types::Json;
+use serde_json::Value;
 use sqlx::FromRow;
 
 /// 短链接数据模型，对应 MySQL 表 `short_links`
@@ -16,10 +16,10 @@ pub struct ShortLink {
     pub long_url: String,
 
     /// 创建时间，自动设置为当前时间
-    pub created_at: NaiveDateTime,
+    pub created_at: DateTime<Utc>,
 
     /// 可选：过期时间，超过该时间链接失效
-    pub expire_at: Option<NaiveDateTime>,
+    pub expire_at: Option<DateTime<Utc>>,
 
     /// 可选：最大访问次数，超过限制后链接失效
     pub max_visits: Option<u32>,
@@ -31,8 +31,8 @@ pub struct ShortLink {
     pub password: Option<String>,
 
     /// 可选：IP 限制规则，JSON 格式
-    pub ip_limit: Option<Json<serde_json::Value>>,
+    pub ip_limit: Option<Value>,
 
     /// 可选：User-Agent 限制规则，JSON 格式
-    pub ua_limit: Option<Json<serde_json::Value>>,
+    pub ua_limit: Option<Value>,
 }

@@ -30,14 +30,15 @@ pub async fn redirect_handler(
     println!("Redis miss or cache not used, querying DB...");
     // 从数据库获取
     match get_link_by_code(&db, &code).await {
-        Ok(Some(url)) => {
-            println!("DB hit: {}", url);
+        Ok(Some(short_link)) => {
+            let url = &short_link.long_url;
+            println!("DB hit: {}", short_link.long_url);
             // 写入 Redis 缓存，设置过期时间 1 小时
             let _: () = cache::set_cached_url(&mut redis_conn, &redis_key, &url, 3600)
                 .await
                 .unwrap_or(());
             HttpResponse::Found()
-                .append_header(("Location", url))
+                .append_header(("Location", &**url))
                 .finish()
         }
         Ok(None) => HttpResponse::NotFound().body("Short URL not found"),
