@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::FromRow;
 
 /// 短链接数据模型，对应 MySQL 表 `short_links`
-#[derive(Debug, Serialize, Deserialize, FromRow)]
+#[derive(Clone, Debug, Serialize, Deserialize, FromRow)]
 pub struct ShortLink {
     /// 主键 ID，自增
     pub id: u64,

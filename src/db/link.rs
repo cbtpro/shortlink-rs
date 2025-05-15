@@ -1,6 +1,7 @@
 use crate::errors::save_link_error::SaveLinkError;
 use crate::models::short_link::ShortLink;
 use crate::routes::shorten::ShortenRequest;
+use log::{error, info};
 use sqlx::types::Json;
 use sqlx::MySqlPool;
 
@@ -72,4 +73,49 @@ pub async fn get_link_by_code(
             .await?;
 
     Ok(short_link)
+}
+pub async fn increment_visit_count(pool: &MySqlPool, id: u64) -> Result<u32, sqlx::Error> {
+    info!(
+        "Attempting to increment visit_count for short_link ID: {}",
+        id
+    );
+
+    let mut tx = pool.begin().await?;
+
+    // 先更新
+    let update_result = sqlx::query!(
+        r#"
+        UPDATE short_links
+        SET visit_count = visit_count + 1
+        WHERE id = ?
+        "#,
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    if update_result.rows_affected() != 1 {
+        error!("Visit count not updated: no matching ID {}", id);
+        tx.rollback().await?;
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    // 然后查询更新后的值
+    let row = sqlx::query!(
+        r#"
+        SELECT visit_count FROM short_links WHERE id = ?
+        "#,
+        id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    info!(
+        "Successfully incremented visit_count for ID: {} -> {}",
+        id, row.visit_count
+    );
+
+    Ok(row.visit_count)
 }
