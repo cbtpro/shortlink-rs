@@ -1,0 +1,3 @@
+[alias]
+# 让 `cargo xtask <command>` 等价于 `cargo run -p xtask -- <command>`
+xtask = "run --package xtask --quiet --"

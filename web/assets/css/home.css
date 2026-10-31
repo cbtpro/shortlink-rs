@@ -10,11 +10,19 @@
   margin-bottom: 22px;
 }
 
+/* 品牌与账号状态同一行：左边是谁，右边是我 */
+.masthead__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
 .brand {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  margin-bottom: 20px;
   font-family: var(--font-mono);
   font-size: 13px;
   color: var(--muted);
@@ -29,6 +37,38 @@
 .brand__name::before {
   content: "/";
   margin-right: 1px;
+  opacity: 0.5;
+}
+
+.account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.account a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+
+.account a:hover {
+  color: var(--text);
+  border-bottom-color: var(--border-strong);
+}
+
+.account__user {
+  max-width: 16ch;
+  overflow: hidden;
+  color: var(--text);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account__sep {
   opacity: 0.5;
 }
 
@@ -54,52 +94,6 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 20px;
-}
-
-.field {
-  margin-bottom: 14px;
-}
-
-.field:last-of-type {
-  margin-bottom: 0;
-}
-
-.field label {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-bottom: 5px;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.field__optional {
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--muted);
-}
-
-.field__optional::before {
-  content: "(";
-}
-
-.field__optional::after {
-  content: ")";
-}
-
-.field__hint {
-  margin: 5px 0 0;
-  font-size: 11px;
-  color: var(--muted);
-}
-
-.field__hint code,
-.result__meta code {
-  font-family: var(--font-mono);
-  font-size: 0.95em;
-  background: var(--surface-soft);
-  border-radius: var(--radius-sm);
-  padding: 0 3px;
 }
 
 /* 勾选类选项：控件与文字同一行，提示文字缩进到文字起点 */
@@ -188,16 +182,6 @@
 
 /* 出错提示 */
 
-.form-error {
-  margin: 12px 0 0;
-  padding: 8px 10px;
-  border-left: 2px solid var(--danger);
-  border-radius: var(--radius-sm);
-  background: var(--danger-soft);
-  color: var(--danger);
-  font-size: 12px;
-}
-
 /* 生成结果 */
 
 .result {
@@ -246,6 +230,15 @@
   margin: 6px 0 0;
   font-size: 11px;
   color: var(--muted);
+}
+
+/* 元信息里会嵌短码或参数名，用等宽字体与周围文字区分 */
+.result__meta code {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+  background: var(--surface-soft);
+  border-radius: var(--radius-sm);
+  padding: 0 3px;
 }
 
 .result__warn {

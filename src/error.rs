@@ -7,6 +7,7 @@ use actix_web::{HttpResponse, ResponseError};
 use serde::Serialize;
 
 use crate::cache::CacheError;
+use crate::domain::account::AccountError;
 use crate::domain::new_link::ValidationError;
 use crate::domain::short_link::AccessDenial;
 use crate::repository::RepoError;
@@ -23,6 +24,18 @@ pub enum AppError {
     /// 未配置 `ADMIN_TOKEN`。用 404 而不是 403，不暴露后台的存在。
     AdminDisabled,
     Unauthorized,
+    /// 注册时邮箱已被占用
+    EmailTaken,
+    /// 登录失败。不区分「没这个邮箱」和「密码不对」，否则等于给人做账号探测。
+    InvalidCredentials,
+    Account(AccountError),
+    /// 请求体解析失败（缺字段、类型不对、不是合法 JSON）。
+    ///
+    /// 不带细节：解析器的原话里有 Rust 类型名与列号，对调用方没有帮助，
+    /// 对探测内部结构的人倒是正好。原始错误进 debug 日志。
+    InvalidBody,
+    /// 后台线程异常结束（例如阻塞任务 panic）。属于服务端故障，细节只进日志。
+    Internal(String),
 }
 
 impl fmt::Display for AppError {
@@ -44,6 +57,11 @@ impl fmt::Display for AppError {
             }
             AppError::AdminDisabled => write!(f, "admin api is disabled"),
             AppError::Unauthorized => write!(f, "unauthorized"),
+            AppError::EmailTaken => write!(f, "email is already registered"),
+            AppError::InvalidCredentials => write!(f, "email or password is incorrect"),
+            AppError::Account(err) => write!(f, "{err}"),
+            AppError::InvalidBody => write!(f, "request body is not valid"),
+            AppError::Internal(detail) => write!(f, "internal task failure: {detail}"),
         }
     }
 }
@@ -52,6 +70,7 @@ impl std::error::Error for AppError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AppError::Validation(err) => Some(err),
+            AppError::Account(err) => Some(err),
             AppError::Storage(err) => Some(err),
             AppError::Cache(err) => Some(err),
             _ => None,
@@ -70,13 +89,18 @@ impl AppError {
     /// 可以安全暴露给调用方的文案，内部细节不外泄。
     fn public_message(&self) -> String {
         match self {
-            AppError::Storage(_) | AppError::Cache(_) => "internal server error".to_string(),
+            AppError::Storage(_) | AppError::Cache(_) | AppError::Internal(_) => {
+                "internal server error".to_string()
+            }
             other => other.to_string(),
         }
     }
 
     fn is_server_fault(&self) -> bool {
-        matches!(self, AppError::Storage(_) | AppError::Cache(_))
+        matches!(
+            self,
+            AppError::Storage(_) | AppError::Cache(_) | AppError::Internal(_)
+        )
     }
 }
 
@@ -89,14 +113,17 @@ impl ResponseError for AppError {
             AppError::AccessDenied(
                 AccessDenial::MissingPassword | AccessDenial::InvalidPassword,
             ) => StatusCode::FORBIDDEN,
-            AppError::AccessDenied(
-                AccessDenial::Expired | AccessDenial::VisitLimitReached,
-            ) => StatusCode::GONE,
-            AppError::Storage(_) | AppError::Cache(_) | AppError::CodeGenerationExhausted => {
-                StatusCode::INTERNAL_SERVER_ERROR
+            AppError::AccessDenied(AccessDenial::Expired | AccessDenial::VisitLimitReached) => {
+                StatusCode::GONE
             }
+            AppError::Storage(_)
+            | AppError::Cache(_)
+            | AppError::CodeGenerationExhausted
+            | AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AppError::AdminDisabled => StatusCode::NOT_FOUND,
-            AppError::Unauthorized => StatusCode::UNAUTHORIZED,
+            AppError::Unauthorized | AppError::InvalidCredentials => StatusCode::UNAUTHORIZED,
+            AppError::EmailTaken => StatusCode::CONFLICT,
+            AppError::Account(_) | AppError::InvalidBody => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -120,6 +147,12 @@ impl From<ValidationError> for AppError {
     }
 }
 
+impl From<AccountError> for AppError {
+    fn from(err: AccountError) -> Self {
+        AppError::Account(err)
+    }
+}
+
 impl From<AccessDenial> for AppError {
     fn from(reason: AccessDenial) -> Self {
         AppError::AccessDenied(reason)
@@ -130,6 +163,7 @@ impl From<RepoError> for AppError {
     fn from(err: RepoError) -> Self {
         match err {
             RepoError::DuplicateCode => AppError::CodeExists,
+            RepoError::DuplicateEmail => AppError::EmailTaken,
             RepoError::NotFound => AppError::LinkNotFound,
             other => AppError::Storage(other),
         }
@@ -189,10 +223,25 @@ mod tests {
             ),
             (AppError::AdminDisabled, StatusCode::NOT_FOUND),
             (AppError::Unauthorized, StatusCode::UNAUTHORIZED),
+            (AppError::EmailTaken, StatusCode::CONFLICT),
+            (AppError::InvalidCredentials, StatusCode::UNAUTHORIZED),
+            (
+                AppError::Account(AccountError::PasswordTooShort),
+                StatusCode::BAD_REQUEST,
+            ),
+            (AppError::InvalidBody, StatusCode::BAD_REQUEST),
+            (
+                AppError::Internal("worker panicked".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
 
         for (error, expected) in cases {
-            assert_eq!(error.status_code(), expected, "unexpected status for {error}");
+            assert_eq!(
+                error.status_code(),
+                expected,
+                "unexpected status for {error}"
+            );
         }
     }
 
@@ -200,7 +249,10 @@ mod tests {
     fn hides_internal_details_from_clients() {
         assert_eq!(storage_error().public_message(), "internal server error");
         assert_eq!(cache_error().public_message(), "internal server error");
-        assert_eq!(AppError::LinkNotFound.public_message(), "short link not found");
+        assert_eq!(
+            AppError::LinkNotFound.public_message(),
+            "short link not found"
+        );
         assert_eq!(
             AppError::AccessDenied(AccessDenial::Expired).public_message(),
             "short link has expired"
@@ -224,6 +276,10 @@ mod tests {
         assert!(matches!(
             AppError::from(RepoError::NotFound),
             AppError::LinkNotFound
+        ));
+        assert!(matches!(
+            AppError::from(RepoError::DuplicateEmail),
+            AppError::EmailTaken
         ));
         assert!(matches!(
             AppError::from(RepoError::Backend("boom".into())),

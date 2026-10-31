@@ -12,6 +12,12 @@ use crate::repository::{LinkOverview, LinkPage, LinkQuery, LinkRepository, Overv
 /// 单页上限。后台表格是人工操作的地方，没人需要一次拉全表。
 const MAX_PAGE_SIZE: u32 = 100;
 
+/// 搜索词长度上限。
+///
+/// 短码最多 10 位、地址最多 2048，搜索词再长也没有意义；
+/// 截断而不是报错 —— 搜索框里多贴了一串东西，给结果比给 400 有用。
+const MAX_KEYWORD_LEN: usize = 100;
+
 pub struct AdminService {
     repository: Arc<dyn LinkRepository>,
     cache: Arc<dyn LinkCache>,
@@ -80,8 +86,8 @@ fn clamp(query: LinkQuery) -> LinkQuery {
         page_size: query.page_size.clamp(1, MAX_PAGE_SIZE),
         keyword: query
             .keyword
-            .map(|keyword| keyword.trim().to_string())
-            .filter(|keyword| !keyword.is_empty()),
+            .map(|keyword| keyword.trim().chars().take(MAX_KEYWORD_LEN).collect())
+            .filter(|keyword: &String| !keyword.is_empty()),
         filter: query.filter,
     }
 }
@@ -112,14 +118,17 @@ mod tests {
 
     const TOKEN: &str = "s3cret-token";
 
-    fn service(token: Option<&str>) -> (AdminService, Arc<InMemoryLinkRepository>, Arc<RecordingCache>) {
+    fn service(
+        token: Option<&str>,
+    ) -> (
+        AdminService,
+        Arc<InMemoryLinkRepository>,
+        Arc<RecordingCache>,
+    ) {
         let repository = Arc::new(InMemoryLinkRepository::new());
         let cache = Arc::new(RecordingCache::new());
-        let service = AdminService::new(
-            repository.clone(),
-            cache.clone(),
-            token.map(str::to_string),
-        );
+        let service =
+            AdminService::new(repository.clone(), cache.clone(), token.map(str::to_string));
         (service, repository, cache)
     }
 
@@ -156,7 +165,10 @@ mod tests {
         let (service, _, _) = service(Some(TOKEN));
 
         assert!(service.authorize(Some(TOKEN)).is_ok());
-        assert!(matches!(service.authorize(None), Err(AppError::Unauthorized)));
+        assert!(matches!(
+            service.authorize(None),
+            Err(AppError::Unauthorized)
+        ));
         assert!(matches!(
             service.authorize(Some("s3cret-toke")),
             Err(AppError::Unauthorized)
@@ -209,6 +221,22 @@ mod tests {
         assert_eq!(page.items.len(), 3, "空关键字不应过滤掉任何记录");
     }
 
+    #[test]
+    fn truncates_overlong_keyword() {
+        let clamped = clamp(LinkQuery {
+            page: 1,
+            page_size: 20,
+            keyword: Some("a".repeat(MAX_KEYWORD_LEN + 50)),
+            filter: Default::default(),
+        });
+
+        assert_eq!(
+            clamped.keyword.as_deref().map(str::len),
+            Some(MAX_KEYWORD_LEN),
+            "超长搜索词应被截断而不是原样带进 LIKE"
+        );
+    }
+
     #[tokio::test]
     async fn delete_removes_link_and_evicts_cache() {
         let (service, repository, cache) = service(Some(TOKEN));
@@ -237,7 +265,10 @@ mod tests {
         service.delete("gone").await.unwrap();
 
         assert!(repository.find_by_code("gone").await.unwrap().is_none());
-        assert!(!cache.contains("gone"), "删链后必须清缓存，否则还能跳到 TTL 结束");
+        assert!(
+            !cache.contains("gone"),
+            "删链后必须清缓存，否则还能跳到 TTL 结束"
+        );
     }
 
     #[tokio::test]
@@ -282,8 +313,14 @@ mod tests {
             Some(TOKEN.to_string()),
         );
 
-        assert!(matches!(service.list(query(), at(12)).await, Err(AppError::Storage(_))));
-        assert!(matches!(service.delete("a").await, Err(AppError::Storage(_))));
+        assert!(matches!(
+            service.list(query(), at(12)).await,
+            Err(AppError::Storage(_))
+        ));
+        assert!(matches!(
+            service.delete("a").await,
+            Err(AppError::Storage(_))
+        ));
         assert!(matches!(
             service
                 .overview(OverviewWindow {

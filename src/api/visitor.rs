@@ -77,9 +77,18 @@ mod tests {
     #[test]
     fn rejects_tampered_values() {
         assert!(!is_well_formed(""));
-        assert!(!is_well_formed("0123456789ABCDEF0123456789abcdef"), "大写不接受");
-        assert!(!is_well_formed("0123456789abcdef0123456789abcde"), "长度不足");
-        assert!(!is_well_formed("0123456789abcdef0123456789abcdeg"), "非十六进制");
+        assert!(
+            !is_well_formed("0123456789ABCDEF0123456789abcdef"),
+            "大写不接受"
+        );
+        assert!(
+            !is_well_formed("0123456789abcdef0123456789abcde"),
+            "长度不足"
+        );
+        assert!(
+            !is_well_formed("0123456789abcdef0123456789abcdeg"),
+            "非十六进制"
+        );
     }
 
     #[test]

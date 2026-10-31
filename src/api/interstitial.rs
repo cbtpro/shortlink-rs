@@ -6,12 +6,21 @@
 use actix_web::http::header;
 use actix_web::HttpResponse;
 
-use super::assets::INTERSTITIAL_HTML;
+use crate::assets::AssetServer;
+
+/// 中转页模板名，与 `web/` 下的文件对应。
+const TEMPLATE: &str = "interstitial.html";
 
 /// 渲染中转页。`target` 来自数据库，必须当作不可信输入处理。
-pub fn render(code: &str, target: &str) -> HttpResponse {
+pub fn render(assets: &AssetServer, code: &str, target: &str) -> HttpResponse {
+    let Some(template) = assets.get(TEMPLATE).and_then(|asset| asset.as_text()) else {
+        // 启动时已校验模板存在，这里只可能是运行期被删
+        log::error!("interstitial template `{TEMPLATE}` is missing");
+        return HttpResponse::InternalServerError().finish();
+    };
+
     let body = fill(
-        INTERSTITIAL_HTML,
+        &template,
         &[("code", code), ("host", host_of(target)), ("url", target)],
     );
 
@@ -74,9 +83,7 @@ fn escape_html(value: &str) -> String {
 /// 取展示用的主机名。取不到就退回整串，反正是当纯文本显示的。
 fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -86,10 +93,10 @@ mod tests {
 
     #[test]
     fn escapes_markup_in_values() {
-        let page = fill("<a href=\"{{url}}\">{{url}}</a>", &[(
-            "url",
-            "https://e.test/\"onmouseover=\"alert(1)",
-        )]);
+        let page = fill(
+            "<a href=\"{{url}}\">{{url}}</a>",
+            &[("url", "https://e.test/\"onmouseover=\"alert(1)")],
+        );
 
         assert!(!page.contains("onmouseover=\"alert"), "属性必须被截断");
         assert!(page.contains("&quot;onmouseover=&quot;alert(1)"));
@@ -128,8 +135,19 @@ mod tests {
 
     #[test]
     fn renders_template_with_target_and_host() {
+        let assets = AssetServer::new(
+            crate::settings::AssetsMode::Embedded,
+            std::path::PathBuf::from("web"),
+            false,
+        )
+        .expect("内嵌资源总是可用");
+        let template = assets
+            .get(TEMPLATE)
+            .and_then(|asset| asset.as_text())
+            .expect("中转页模板必须打包进二进制");
+
         let page = fill(
-            INTERSTITIAL_HTML,
+            &template,
             &[
                 ("code", "abc"),
                 ("host", "example.com"),

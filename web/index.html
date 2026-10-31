@@ -8,26 +8,32 @@
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="assets/css/base.css" />
     <link rel="stylesheet" href="assets/css/home.css" />
+    <!-- 运行时配置：站点名、接口前缀等由服务端下发，换环境不用改这里 -->
+    <script src="app-config.js"></script>
   </head>
   <body>
     <div class="page">
       <header class="masthead">
-        <div class="brand">
-          <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
-            <rect width="32" height="32" rx="4" fill="#b4471f" />
-            <path
-              d="M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2"
-              stroke="#fff"
-              stroke-width="2"
-              stroke-linecap="round"
-              fill="none"
-            />
-          </svg>
-          <span class="brand__name">shortlink</span>
+        <div class="masthead__top">
+          <div class="brand">
+            <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+              <rect width="32" height="32" rx="4" fill="#b4471f" />
+              <path
+                d="M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2"
+                stroke="#fff"
+                stroke-width="2"
+                stroke-linecap="round"
+                fill="none"
+              />
+            </svg>
+            <span class="brand__name">shortlink</span>
+          </div>
+          <!-- 登录态由 home.js 渲染：未登录显示入口，登录后显示昵称与退出 -->
+          <div class="account" id="account"></div>
         </div>
         <h1>短链接生成</h1>
         <p class="lead">
-          贴上长网址生成短链。可以指定短码、有效期、访问次数上限和密码，不需要注册。
+          贴上长网址生成短链。可以指定短码、有效期、访问次数上限和密码。登录后新建的短链挂在账号下，换设备也能找到。
         </p>
       </header>
 
@@ -45,6 +51,7 @@
                 inputmode="url"
                 autocomplete="off"
                 spellcheck="false"
+                maxlength="2048"
                 placeholder="https://example.com/a/very/long/path?with=query"
                 required
               />
@@ -72,19 +79,38 @@
                 <div class="field">
                   <label for="expire">有效期至</label>
                   <input id="expire" name="expire" type="datetime-local" />
-                  <p class="field__hint">留空则长期有效，按本地时间算。</p>
+                  <p class="field__hint">留空则长期有效，按本地时间算，必须晚于现在。</p>
                 </div>
 
                 <div class="field">
                   <label for="max-visits">访问次数上限</label>
-                  <input id="max-visits" name="maxVisits" type="number" min="1" step="1" inputmode="numeric" placeholder="不限" />
-                  <p class="field__hint">达到上限后返回 410。</p>
+                  <input
+                    id="max-visits"
+                    name="maxVisits"
+                    type="number"
+                    min="1"
+                    max="100000000"
+                    step="1"
+                    inputmode="numeric"
+                    placeholder="不限"
+                  />
+                  <p class="field__hint">1 到 1 亿之间的整数，达到上限后返回 410。</p>
                 </div>
 
                 <div class="field">
                   <label for="password">访问密码</label>
-                  <input id="password" name="password" type="text" autocomplete="off" spellcheck="false" placeholder="不设密码" />
-                  <p class="field__hint">访问时需带上 <code>?password=</code>。</p>
+                  <input
+                    id="password"
+                    name="password"
+                    type="text"
+                    autocomplete="off"
+                    spellcheck="false"
+                    maxlength="64"
+                    placeholder="不设密码"
+                  />
+                  <p class="field__hint">
+                    最多 64 位，不能含空格、引号、反斜杠、分号。访问时需带上 <code>?password=</code>。
+                  </p>
                 </div>
 
                 <div class="field field--check">
@@ -133,7 +159,7 @@
       </main>
 
       <footer class="footer">
-        <span>记录按浏览器匿名保存</span>
+        <span id="footer-note">未登录：记录按浏览器保存</span>
         <span class="footer__sep">·</span>
         <a href="/admin">管理后台</a>
       </footer>

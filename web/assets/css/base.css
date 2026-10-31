@@ -193,6 +193,64 @@ input[aria-invalid="true"] {
   box-shadow: 0 0 0 2px var(--danger-soft);
 }
 
+/* 表单字段：首页、登录页共用 */
+
+.field {
+  margin-bottom: 14px;
+}
+
+.field:last-of-type {
+  margin-bottom: 0;
+}
+
+.field label {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.field__optional {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.field__optional::before {
+  content: "(";
+}
+
+.field__optional::after {
+  content: ")";
+}
+
+.field__hint {
+  margin: 5px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.field__hint code {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+  background: var(--surface-soft);
+  border-radius: var(--radius-sm);
+  padding: 0 3px;
+}
+
+/* 表单级错误：只在提交失败时出现，与字段级 aria-invalid 分工 */
+.form-error {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--danger);
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+}
+
 /* 轻提示 */
 
 .toast {

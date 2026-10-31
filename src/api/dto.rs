@@ -7,7 +7,7 @@ use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::new_link::NewShortLink;
+use crate::domain::new_link::{NewShortLink, ValidationError};
 use crate::domain::short_link::ShortLink;
 
 /// 本地时间 → UTC，供写库使用。
@@ -31,7 +31,9 @@ pub struct CreateLinkRequest {
     /// 留空则由服务端生成
     pub custom_code: Option<String>,
     pub expire_at: Option<NaiveDateTime>,
-    pub max_visits: Option<u32>,
+    /// 用 `i64` 而不是 `u32`：负数得先能读进来，才谈得上「拒绝并说清原因」。
+    /// 用 `u32` 的话 serde 在反序列化阶段就报错，客户端拿到的是解析器的原话。
+    pub max_visits: Option<i64>,
     pub password: Option<String>,
     pub ip_limit: Option<Value>,
     pub ua_limit: Option<Value>,
@@ -39,19 +41,52 @@ pub struct CreateLinkRequest {
     pub interstitial: Option<bool>,
 }
 
-impl From<CreateLinkRequest> for NewShortLink {
-    fn from(request: CreateLinkRequest) -> Self {
-        Self {
+/// 请求体 → 业务意图。
+///
+/// 这里是**归一化**的唯一位置：去首尾空格、空串归 `None`、负数字段拒绝。
+/// 转换可能失败，所以是 `TryFrom` 而不是 `From` —— 静默丢掉非法值比报错危险得多。
+impl TryFrom<CreateLinkRequest> for NewShortLink {
+    type Error = ValidationError;
+
+    fn try_from(request: CreateLinkRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
             // 校验时会 trim，落库前同样 trim，避免把首尾空格带进 Location 头
             url: request.url.trim().to_string(),
-            code: request.custom_code,
+            code: normalize_optional(request.custom_code),
+            // 归属由 handler 按登录态补上，请求体说了不算
+            owner_id: None,
             expire_at: request.expire_at.map(local_to_utc),
-            max_visits: request.max_visits,
-            password: request.password,
+            max_visits: normalize_max_visits(request.max_visits)?,
+            password: normalize_password(request.password),
             ip_limit: request.ip_limit,
             ua_limit: request.ua_limit,
             interstitial: request.interstitial.unwrap_or(false),
-        }
+        })
+    }
+}
+
+/// 去首尾空格，全空视为「没填」。
+fn normalize_optional(raw: Option<String>) -> Option<String> {
+    raw.map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// 密码只 trim，不把空串归 `None`。
+///
+/// 「留空」是没设密码，「填了几个空格」是想设密码却没填对 —— 后者必须报错，
+/// 悄悄降级成「不设密码」会让人以为链接有保护。
+fn normalize_password(raw: Option<String>) -> Option<String> {
+    raw.as_deref().map(str::trim).map(str::to_string)
+}
+
+fn normalize_max_visits(raw: Option<i64>) -> Result<Option<u32>, ValidationError> {
+    match raw {
+        None => Ok(None),
+        // 负数不能被当成「不限制」放过去
+        Some(value) if value < 0 => Err(ValidationError::InvalidMaxVisits),
+        Some(value) => u32::try_from(value)
+            .map(Some)
+            .map_err(|_| ValidationError::InvalidMaxVisits),
     }
 }
 
@@ -141,10 +176,13 @@ mod tests {
         serde_json::from_str(&raw).expect("request should deserialize")
     }
 
+    fn convert(extra: &str) -> NewShortLink {
+        NewShortLink::try_from(request_json(extra)).expect("request should convert")
+    }
+
     #[test]
     fn maps_custom_code_to_domain_field() {
-        let request = request_json(r#", "custom_code": "promo", "max_visits": 3"#);
-        let new_link: NewShortLink = request.into();
+        let new_link = convert(r#", "custom_code": "promo", "max_visits": 3"#);
 
         assert_eq!(new_link.code.as_deref(), Some("promo"));
         assert_eq!(new_link.max_visits, Some(3));
@@ -152,15 +190,45 @@ mod tests {
 
     #[test]
     fn trims_surrounding_whitespace_of_url() {
-        let new_link: NewShortLink = request_json("").into();
-        assert_eq!(new_link.url, "https://example.com/a");
+        assert_eq!(convert("").url, "https://example.com/a");
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace_of_custom_code() {
+        // 用户复制短码时常带空格，「 promo 」按「promo」处理，不要拿空格去报错
+        assert_eq!(
+            convert(r#", "custom_code": "  promo  ""#).code.as_deref(),
+            Some("promo")
+        );
+    }
+
+    #[test]
+    fn blank_custom_code_means_generate_one() {
+        assert!(convert(r#", "custom_code": "   ""#).code.is_none());
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace_of_password() {
+        assert_eq!(
+            convert(r#", "password": "  s3cret  ""#).password.as_deref(),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
+    fn blank_password_stays_empty_instead_of_becoming_none() {
+        // 交给领域层报“空密码”，不能悄悄变成「不设密码」
+        let new_link = convert(r#", "password": "   ""#);
+        assert_eq!(new_link.password.as_deref(), Some(""));
+        assert!(new_link.validate(10, at("2026-06-01 12:00:00")).is_err());
     }
 
     #[test]
     fn absent_optional_fields_stay_none() {
-        let new_link: NewShortLink = request_json("").into();
+        let new_link = convert("");
         assert!(new_link.code.is_none());
         assert!(new_link.expire_at.is_none());
+        assert!(new_link.max_visits.is_none());
         assert!(new_link.password.is_none());
         assert!(new_link.ip_limit.is_none());
         assert!(new_link.ua_limit.is_none());
@@ -169,18 +237,15 @@ mod tests {
 
     #[test]
     fn maps_interstitial_flag() {
-        let enabled: NewShortLink = request_json(r#", "interstitial": true"#).into();
-        assert!(enabled.interstitial);
+        assert!(convert(r#", "interstitial": true"#).interstitial);
 
         // 显式 false 与缺省同义
-        let disabled: NewShortLink = request_json(r#", "interstitial": false"#).into();
-        assert!(!disabled.interstitial);
+        assert!(!convert(r#", "interstitial": false"#).interstitial);
     }
 
     #[test]
     fn converts_expire_at_to_utc() {
-        let request = request_json(r#", "expire_at": "2026-12-31T23:59:59""#);
-        let new_link: NewShortLink = request.into();
+        let new_link = convert(r#", "expire_at": "2026-12-31T23:59:59""#);
 
         assert_eq!(
             new_link.expire_at,
@@ -189,11 +254,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_negative_max_visits() {
+        let error = NewShortLink::try_from(request_json(r#", "max_visits": -1"#))
+            .expect_err("负数必须被拒绝");
+        assert_eq!(error, ValidationError::InvalidMaxVisits);
+    }
+
+    #[test]
+    fn rejects_max_visits_beyond_u32() {
+        let error = NewShortLink::try_from(request_json(r#", "max_visits": 4294967296"#))
+            .expect_err("超出 u32 必须被拒绝");
+        assert_eq!(error, ValidationError::InvalidMaxVisits);
+    }
+
+    #[test]
+    fn accepts_max_visits_at_u32_ceiling() {
+        // 类型上界能收下，业务上界由领域层的 validate 判定
+        let new_link = convert(r#", "max_visits": 4294967295"#);
+        assert_eq!(new_link.max_visits, Some(u32::MAX));
+    }
+
+    #[test]
     fn response_renders_created_at_as_local_wall_clock() {
         let utc = at("2026-01-01 00:00:00");
         let link = ShortLink {
             id: 1,
             code: "abc".into(),
+            user_id: None,
             long_url: "https://example.com".into(),
             created_at: utc,
             expire_at: None,

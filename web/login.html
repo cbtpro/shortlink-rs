@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>登录</title>
+    <meta name="description" content="登录或注册后，创建的短链接会归到你的账号下，换设备也能找到。" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="assets/css/base.css" />
+    <link rel="stylesheet" href="assets/css/auth.css" />
+    <!-- 运行时配置：站点名、接口前缀等由服务端下发 -->
+    <script src="app-config.js"></script>
+  </head>
+  <body>
+    <div class="auth">
+      <header class="auth__head">
+        <a class="brand" href="/">
+          <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+            <rect width="32" height="32" rx="4" fill="#b4471f" />
+            <path
+              d="M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2"
+              stroke="#fff"
+              stroke-width="2"
+              stroke-linecap="round"
+              fill="none"
+            />
+          </svg>
+          <span class="brand__name">shortlink</span>
+        </a>
+        <p class="auth__lead" id="auth-lead">登录后，新建的短链会挂在你的账号下。</p>
+      </header>
+
+      <div class="auth__panel">
+        <div class="tabs" role="tablist" aria-label="登录或注册">
+          <button
+            class="tab tab--active"
+            type="button"
+            role="tab"
+            id="tab-login"
+            aria-selected="true"
+            aria-controls="auth-form"
+            data-mode="login"
+          >
+            登录
+          </button>
+          <button
+            class="tab"
+            type="button"
+            role="tab"
+            id="tab-register"
+            aria-selected="false"
+            aria-controls="auth-form"
+            data-mode="register"
+          >
+            注册
+          </button>
+        </div>
+
+        <form id="auth-form" novalidate>
+          <div class="field">
+            <label for="email">邮箱</label>
+            <input
+              id="email"
+              name="email"
+              type="email"
+              inputmode="email"
+              autocomplete="email"
+              autocapitalize="off"
+              spellcheck="false"
+              maxlength="254"
+              required
+            />
+          </div>
+
+          <div class="field" id="name-field" hidden>
+            <label for="display-name">昵称<span class="field__optional">可选</span></label>
+            <input
+              id="display-name"
+              name="displayName"
+              type="text"
+              autocomplete="nickname"
+              maxlength="32"
+              placeholder="默认用邮箱前缀"
+            />
+          </div>
+
+          <div class="field">
+            <label for="password">密码</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              autocomplete="current-password"
+              minlength="8"
+              maxlength="128"
+              required
+            />
+            <p class="field__hint" id="password-hint">至少 8 位，区分大小写。</p>
+          </div>
+
+          <p class="form-error" id="auth-error" role="alert" hidden></p>
+
+          <button class="button button--primary auth__submit" type="submit" id="auth-submit">
+            <span class="button__label" id="submit-label">登录</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+      </div>
+
+      <p class="auth__foot">
+        <a href="/">返回首页</a>
+        <span class="auth__sep">·</span>
+        <span>不登录也能创建短链，只是记录存在本浏览器里</span>
+      </p>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="assets/js/pages/login.js"></script>
+  </body>
+</html>

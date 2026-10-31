@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use chrono::NaiveDateTime;
+
 use crate::domain::code::ShortCodeGenerator;
 use crate::domain::new_link::NewShortLink;
 use crate::domain::short_link::ShortLink;
@@ -41,8 +43,12 @@ impl ShortenService {
         format!("{}/{}", self.public_base_url, code)
     }
 
-    pub async fn create(&self, request: NewShortLink) -> Result<ShortLink, AppError> {
-        request.validate(self.max_code_length)?;
+    pub async fn create(
+        &self,
+        request: NewShortLink,
+        now: NaiveDateTime,
+    ) -> Result<ShortLink, AppError> {
+        request.validate(self.max_code_length, now)?;
 
         match request.code.clone() {
             Some(code) => self.save(&request, &code).await,
@@ -91,6 +97,11 @@ mod tests {
         )
     }
 
+    fn now() -> NaiveDateTime {
+        NaiveDateTime::parse_from_str("2026-06-01 12:00:00", "%Y-%m-%d %H:%M:%S")
+            .expect("valid datetime")
+    }
+
     fn request(url: &str, code: Option<&str>) -> NewShortLink {
         NewShortLink {
             url: url.to_string(),
@@ -102,7 +113,7 @@ mod tests {
     #[tokio::test]
     async fn generates_code_when_absent() {
         let link = service()
-            .create(request("https://example.com", None))
+            .create(request("https://example.com", None), now())
             .await
             .expect("create should succeed");
         assert_eq!(link.code.len(), 7);
@@ -112,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn keeps_custom_code() {
         let link = service()
-            .create(request("https://example.com", Some("promo")))
+            .create(request("https://example.com", Some("promo")), now())
             .await
             .expect("create should succeed");
         assert_eq!(link.code, "promo");
@@ -122,29 +133,57 @@ mod tests {
     async fn rejects_duplicate_custom_code() {
         let service = service();
         service
-            .create(request("https://example.com", Some("dup")))
+            .create(request("https://example.com", Some("dup")), now())
             .await
             .expect("first insert should succeed");
 
-        let result = service.create(request("https://example.org", Some("dup"))).await;
+        let result = service
+            .create(request("https://example.org", Some("dup")), now())
+            .await;
         assert!(matches!(result, Err(AppError::CodeExists)));
     }
 
     #[tokio::test]
     async fn rejects_invalid_url() {
-        let result = service().create(request("javascript:alert(1)", None)).await;
+        let result = service()
+            .create(request("javascript:alert(1)", None), now())
+            .await;
         assert!(matches!(
             result,
             Err(AppError::Validation(ValidationError::UnsupportedScheme))
         ));
     }
 
+    #[tokio::test]
+    async fn rejects_expiry_before_now() {
+        // 时钟由调用方传入，所以「过去」是可复现的
+        let mut link = request("https://example.com", None);
+        link.expire_at = Some(now() - chrono::Duration::seconds(1));
+
+        let result = service().create(link, now()).await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Validation(ValidationError::ExpireInPast))
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_max_visits() {
+        let mut link = request("https://example.com", None);
+        link.max_visits = Some(0);
+
+        let result = service().create(link, now()).await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::Validation(ValidationError::InvalidMaxVisits))
+        ));
+    }
+
     #[test]
     fn builds_public_url() {
-        assert_eq!(
-            service().short_url("abc"),
-            "https://s.example.com/abc"
-        );
+        assert_eq!(service().short_url("abc"), "https://s.example.com/abc");
     }
 
     fn service_with_generator(
@@ -166,7 +205,7 @@ mod tests {
         let service = service_with_generator(repository, generator.clone());
 
         let link = service
-            .create(request("https://example.org", None))
+            .create(request("https://example.org", None), now())
             .await
             .expect("second attempt should succeed");
 
@@ -186,7 +225,9 @@ mod tests {
         let generator = Arc::new(ScriptedCodeGenerator::new(&["taken"]));
         let service = service_with_generator(repository, generator.clone());
 
-        let result = service.create(request("https://example.org", None)).await;
+        let result = service
+            .create(request("https://example.org", None), now())
+            .await;
 
         assert!(matches!(result, Err(AppError::CodeGenerationExhausted)));
         assert_eq!(generator.taken(), MAX_CODE_ATTEMPTS);
@@ -196,7 +237,7 @@ mod tests {
     async fn custom_code_can_be_shorter_than_generated_length() {
         // 自动生成的码长是建议值，自定义短码只受上限约束
         let link = service()
-            .create(request("https://example.com", Some("a")))
+            .create(request("https://example.com", Some("a")), now())
             .await
             .expect("create should succeed");
         assert_eq!(link.code, "a");
@@ -213,7 +254,7 @@ mod tests {
         );
 
         let result = service
-            .create(request("https://example.com", Some("abcde")))
+            .create(request("https://example.com", Some("abcde")), now())
             .await;
 
         assert!(matches!(
@@ -234,7 +275,9 @@ mod tests {
             "https://s.example.com",
         );
 
-        let result = service.create(request("https://example.com", None)).await;
+        let result = service
+            .create(request("https://example.com", None), now())
+            .await;
 
         assert!(matches!(result, Err(AppError::Storage(_))));
         assert_eq!(generator.taken(), 1, "非碰撞错误不应重试");

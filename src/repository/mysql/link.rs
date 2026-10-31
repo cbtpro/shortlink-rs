@@ -1,32 +1,39 @@
-//! 基于 MySQL 的仓储实现。
+//! 短链与访客创建记录的 MySQL 实现。
 
 use chrono::{NaiveDateTime, Utc};
 use sqlx::types::Json;
 use sqlx::MySqlPool;
 
-use super::{
-    CreationHistory, LinkFilter, LinkOverview, LinkPage, LinkQuery, LinkRepository,
-    OverviewWindow, RepoError,
-};
+use super::is_unique_violation;
 use crate::domain::new_link::NewShortLink;
 use crate::domain::short_link::ShortLink;
+use crate::repository::{
+    CreationHistory, LinkFilter, LinkOverview, LinkPage, LinkQuery, LinkRepository, OverviewWindow,
+    RepoError,
+};
 use crate::types::BoxFuture;
 
 /// 字段顺序必须与 `ShortLink` 的字段一一对应，新增列时同步修改。
-const COLUMNS: &str = "id, code, long_url, created_at, expire_at, \
+const COLUMNS: &str = "id, code, user_id, long_url, created_at, expire_at, \
      max_visits, visit_count, password, ip_limit, ua_limit, interstitial";
 
 /// 与 [`COLUMNS`] 相同的字段，但都带上表别名，供 join 使用。
-const LINK_COLUMNS: &str = "l.id, l.code, l.long_url, l.created_at, l.expire_at, \
+const LINK_COLUMNS: &str = "l.id, l.code, l.user_id, l.long_url, l.created_at, l.expire_at, \
      l.max_visits, l.visit_count, l.password, l.ip_limit, l.ua_limit, l.interstitial";
 
 const INSERT_SQL: &str = "INSERT INTO short_links \
-     (code, long_url, expire_at, max_visits, password, ip_limit, ua_limit, interstitial) \
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+     (code, user_id, long_url, expire_at, max_visits, password, ip_limit, ua_limit, interstitial) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
 const ADD_VISITS_SQL: &str = "UPDATE short_links SET visit_count = visit_count + ? WHERE code = ?";
 
 const DELETE_SQL: &str = "DELETE FROM short_links WHERE code = ?";
+
+const DELETE_OWNED_SQL: &str = "DELETE FROM short_links WHERE code = ? AND user_id = ?";
+
+const CODES_OF_OWNER_SQL: &str = "SELECT code FROM short_links WHERE user_id = ?";
+
+const DELETE_ALL_OWNED_SQL: &str = "DELETE FROM short_links WHERE user_id = ?";
 
 /// 同一访客重复创建同一短码时刷新时间，而不是报冲突。
 ///
@@ -79,6 +86,7 @@ impl LinkRepository for MySqlLinkRepository {
         Box::pin(async move {
             let result = sqlx::query(INSERT_SQL)
                 .bind(code)
+                .bind(link.owner_id)
                 .bind(&link.url)
                 .bind(link.expire_at)
                 .bind(link.max_visits)
@@ -140,7 +148,8 @@ impl LinkRepository for MySqlLinkRepository {
                 "SELECT {COLUMNS} FROM short_links{conditions} \
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
             );
-            let count_sql = format!("SELECT CAST(COUNT(*) AS UNSIGNED) FROM short_links{conditions}");
+            let count_sql =
+                format!("SELECT CAST(COUNT(*) AS UNSIGNED) FROM short_links{conditions}");
 
             // 两条 SQL 的占位符顺序必须与各自的绑定顺序严格一致
             let mut select = sqlx::query_as::<_, ShortLink>(&select_sql);
@@ -166,10 +175,7 @@ impl LinkRepository for MySqlLinkRepository {
         })
     }
 
-    fn overview(
-        &self,
-        window: OverviewWindow,
-    ) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
+    fn overview(&self, window: OverviewWindow) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
         Box::pin(async move {
             let (total_links, total_visits, created_today, expiring_soon) =
                 sqlx::query_as::<_, (u64, u64, u64, u64)>(OVERVIEW_SQL)
@@ -196,6 +202,63 @@ impl LinkRepository for MySqlLinkRepository {
                 .await?
                 .rows_affected();
             Ok(affected > 0)
+        })
+    }
+
+    fn list_by_owner(
+        &self,
+        owner_id: u64,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<ShortLink>, RepoError>> {
+        Box::pin(async move {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM short_links WHERE user_id = ? \
+                 ORDER BY created_at DESC, id DESC LIMIT ?"
+            );
+            sqlx::query_as::<_, ShortLink>(&sql)
+                .bind(owner_id)
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn delete_owned<'a>(
+        &'a self,
+        owner_id: u64,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(async move {
+            let affected = sqlx::query(DELETE_OWNED_SQL)
+                .bind(code)
+                .bind(owner_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+            Ok(affected > 0)
+        })
+    }
+
+    fn delete_all_owned(&self, owner_id: u64) -> BoxFuture<'_, Result<Vec<String>, RepoError>> {
+        Box::pin(async move {
+            // 先查后删：缓存要按短码逐条失效，而 MySQL 的 DELETE 不回报删了哪些行。
+            // 放在同一事务里，避免「查到了，删之前已经被别的请求删掉」造成错配。
+            let mut tx = self.pool.begin().await?;
+            let codes: Vec<String> = sqlx::query_scalar(CODES_OF_OWNER_SQL)
+                .bind(owner_id)
+                .fetch_all(&mut *tx)
+                .await?;
+
+            if !codes.is_empty() {
+                sqlx::query(DELETE_ALL_OWNED_SQL)
+                    .bind(owner_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            tx.commit().await?;
+            Ok(codes)
         })
     }
 }
@@ -303,12 +366,6 @@ fn like_pattern(keyword: &str) -> String {
     format!("%{escaped}%")
 }
 
-/// 唯一键冲突判定。依赖具体错误码而不是字符串匹配，换 MySQL 版本也不会失效。
-fn is_unique_violation(err: &sqlx::Error) -> bool {
-    err.as_database_error()
-        .is_some_and(|db_err| db_err.is_unique_violation())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +392,12 @@ mod tests {
     #[test]
     fn exhausted_filter_binds_nothing() {
         // `ALL` 与 `EXHAUSTED` 都不需要时间参数，绑定逻辑必须与之一致
-        assert_eq!(build_conditions(&query(None, LinkFilter::All)).matches('?').count(), 0);
+        assert_eq!(
+            build_conditions(&query(None, LinkFilter::All))
+                .matches('?')
+                .count(),
+            0
+        );
         assert_eq!(
             build_conditions(&query(None, LinkFilter::Exhausted))
                 .matches('?')

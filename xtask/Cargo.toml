@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 刻意不引入任何依赖：构建脚本要在离线环境、任何一台装了 Rust 的机器上直接跑。
+[dependencies]

@@ -14,10 +14,28 @@ use std::time::Duration;
 use crate::cache::{CacheError, LinkCache, PendingVisit, VisitCounter};
 use crate::domain::code::ShortCodeGenerator;
 use crate::domain::short_link::CachedLink;
-use crate::repository::{LinkOverview, LinkPage, LinkQuery, LinkRepository, OverviewWindow, RepoError};
+use crate::repository::{
+    LinkOverview, LinkPage, LinkQuery, LinkRepository, OverviewWindow, RepoError,
+};
 use crate::types::BoxFuture;
 
 pub use crate::repository::memory::InMemoryLinkRepository;
+
+/// 不做散列的替身：把明文当成「散列」。
+///
+/// 用例层测的是流程（谁什么时候被拒绝），不是 PBKDF2 本身；用真散列会让每个
+/// 用例多跑几百毫秒。散列算法自己的正确性在 `security::password` 里单独测。
+pub struct PlainHasher;
+
+impl crate::security::password::PasswordHasher for PlainHasher {
+    fn hash(&self, password: &str) -> String {
+        format!("plain${password}")
+    }
+
+    fn verify(&self, password: &str, encoded: &str) -> bool {
+        encoded == format!("plain${password}")
+    }
+}
 
 /// 构造一个后端失败错误。
 ///
@@ -350,14 +368,31 @@ impl LinkRepository for BrokenRepository {
         Box::pin(async { Err(repo_failure()) })
     }
 
-    fn overview(
-        &self,
-        _window: OverviewWindow,
-    ) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
+    fn overview(&self, _window: OverviewWindow) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
         Box::pin(async { Err(repo_failure()) })
     }
 
     fn delete_by_code<'a>(&'a self, _code: &'a str) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn list_by_owner(
+        &self,
+        _owner_id: u64,
+        _limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<crate::domain::short_link::ShortLink>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn delete_owned<'a>(
+        &'a self,
+        _owner_id: u64,
+        _code: &'a str,
+    ) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn delete_all_owned(&self, _owner_id: u64) -> BoxFuture<'_, Result<Vec<String>, RepoError>> {
         Box::pin(async { Err(repo_failure()) })
     }
 }

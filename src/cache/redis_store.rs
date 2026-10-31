@@ -9,8 +9,8 @@ use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, Client};
 
 use super::{CacheError, LinkCache, PendingVisit, VisitCounter};
-use crate::config::redact_credentials;
 use crate::domain::short_link::CachedLink;
+use crate::settings::redact_credentials;
 use crate::types::BoxFuture;
 
 /// 建连超时。对端地址不可达时 TCP 会一直重传到系统默认超时（几十秒），
@@ -43,7 +43,9 @@ pub async fn connect(url: &str) -> anyhow::Result<MultiplexedConnection> {
 
     tokio::time::timeout(CONNECT_TIMEOUT, client.get_multiplexed_async_connection())
         .await
-        .map_err(|_| anyhow!("connecting to Redis timed out after {CONNECT_TIMEOUT:?}: {endpoint}"))?
+        .map_err(|_| {
+            anyhow!("connecting to Redis timed out after {CONNECT_TIMEOUT:?}: {endpoint}")
+        })?
         .with_context(|| format!("failed to connect to Redis at {endpoint}"))
 }
 

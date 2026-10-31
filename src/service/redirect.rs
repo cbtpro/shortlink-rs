@@ -309,7 +309,10 @@ mod tests {
     #[tokio::test]
     async fn interstitial_links_land_on_the_confirmation_page() {
         let repository = Arc::new(InMemoryLinkRepository::new());
-        repository.insert(&interstitial_link(), "gate").await.unwrap();
+        repository
+            .insert(&interstitial_link(), "gate")
+            .await
+            .unwrap();
 
         let counter = Arc::new(RecordingCounter::new());
         let service = service_with_deps(repository, Arc::new(NoOpCache), counter.clone());
@@ -345,17 +348,16 @@ mod tests {
     #[tokio::test]
     async fn write_back_cache_carries_the_setting() {
         let repository = Arc::new(InMemoryLinkRepository::new());
-        repository.insert(&interstitial_link(), "gate").await.unwrap();
+        repository
+            .insert(&interstitial_link(), "gate")
+            .await
+            .unwrap();
 
         let cache = Arc::new(RecordingCache::new());
         let service = service_with_deps(repository, cache.clone(), Arc::new(NoOpCounter));
         service.resolve("gate", None).await.unwrap();
 
-        let stored = cache
-            .get("gate")
-            .await
-            .unwrap()
-            .expect("普通链接应被回填");
+        let stored = cache.get("gate").await.unwrap().expect("普通链接应被回填");
         assert!(stored.interstitial);
     }
 

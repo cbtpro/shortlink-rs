@@ -1,3 +1,7 @@
 /.history
 /target
-.workbuddy/
+/dist
+# 个人覆盖层与本地密钥，不入库；模板见 .env.example
+/.env
+/.env.local
+/.workbuddy/

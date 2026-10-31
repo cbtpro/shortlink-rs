@@ -327,6 +327,7 @@
 }
 
 .row-action {
+  display: inline-block;
   border: none;
   border-radius: var(--radius-sm);
   background: none;
@@ -335,6 +336,9 @@
   font-size: 11px;
   color: var(--muted);
   cursor: pointer;
+  /* 「打开」是真链接，去掉下划线才和相邻的按钮长得一致 */
+  text-decoration: none;
+  line-height: 1.4;
 }
 
 .row-action:hover {

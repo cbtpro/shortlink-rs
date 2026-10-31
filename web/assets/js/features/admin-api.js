@@ -1,4 +1,4 @@
-import { API_BASE } from "../core/api-base.js";
+import { apiBase } from "../core/api-base.js";
 import { ApiError, request } from "../core/http.js";
 
 /** 口令无效，调用方应退回登录状态 */
@@ -15,7 +15,7 @@ const MESSAGES = {
 export function createAdminClient(readToken) {
   async function call(path, init = {}) {
     try {
-      return await request(`${API_BASE}/admin/api${path}`, {
+      return await request(`${apiBase()}/admin/api${path}`, {
         ...init,
         headers: { Authorization: `Bearer ${readToken()}`, ...(init.headers || {}) },
       });

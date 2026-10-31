@@ -86,7 +86,9 @@ impl VisitFlusher {
 mod tests {
     use super::*;
     use crate::domain::new_link::NewShortLink;
-    use crate::test_support::{BrokenCounter, BrokenRepository, InMemoryLinkRepository, RecordingCounter};
+    use crate::test_support::{
+        BrokenCounter, BrokenRepository, InMemoryLinkRepository, RecordingCounter,
+    };
 
     fn link() -> NewShortLink {
         NewShortLink {

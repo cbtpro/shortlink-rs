@@ -1,0 +1,135 @@
+/* 登录 / 注册页。基础控件与表单样式在 base.css。 */
+
+.auth {
+  width: min(100% - 40px, 380px);
+  margin: 0 auto;
+  padding: 56px 0 40px;
+}
+
+.auth__head {
+  margin-bottom: 18px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 16px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.brand__mark {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius);
+}
+
+.brand__name::before {
+  content: "/";
+  margin-right: 1px;
+  opacity: 0.5;
+}
+
+.auth__lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.auth__panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  padding: 18px 20px 20px;
+}
+
+/* 分段切换：两个标签贴在一起，用一条底线区分当前项 */
+
+.tabs {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  position: relative;
+  padding: 0 0 8px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tab--active {
+  color: var(--text);
+}
+
+.tab--active::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--accent);
+}
+
+.auth__submit {
+  width: 100%;
+  margin-top: 16px;
+  padding: 9px 16px;
+}
+
+.auth__foot {
+  margin: 16px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.auth__foot a {
+  color: var(--muted);
+}
+
+.auth__foot a:hover {
+  color: var(--text);
+}
+
+.auth__sep {
+  margin: 0 5px;
+}
+
+@media (max-width: 420px) {
+  .auth {
+    width: min(100% - 24px, 380px);
+    padding-top: 36px;
+  }
+
+  .auth__panel {
+    padding: 16px;
+  }
+
+  .auth__foot span:last-child {
+    display: none;
+  }
+
+  .auth__sep {
+    display: none;
+  }
+}

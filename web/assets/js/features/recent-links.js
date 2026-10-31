@@ -1,22 +1,25 @@
-import { API_BASE } from "../core/api-base.js";
+import { apiBase } from "../core/api-base.js";
 import { request } from "../core/http.js";
 
 /**
- * 「最近创建」的读写。
+ * 首页列表的读写。
  *
- * 记录存在服务端，按浏览器匿名 cookie 归属：换设备看不到，清了 cookie 也看不到。
- * 同源请求默认会带上那个 cookie，这里不用额外配置。
+ * 同一组接口服务两种身份，行为由服务端按会话决定：
+ * - 登录：返回用户名下的链接，删除等于让短链失效；
+ * - 未登录：返回本浏览器匿名 cookie 记录的创建，删除只是移出清单。
+ *
+ * 前端不需要传身份参数 —— 会话在 HttpOnly cookie 里，同源请求会自动带上。
  */
 
 export async function list() {
-  const body = await request(`${API_BASE}/recent`);
+  const body = await request(`${apiBase()}/recent`);
   return Array.isArray(body?.items) ? body.items : [];
 }
 
 export async function forget(code) {
-  await request(`${API_BASE}/recent/${encodeURIComponent(code)}`, { method: "DELETE" });
+  await request(`${apiBase()}/recent/${encodeURIComponent(code)}`, { method: "DELETE" });
 }
 
 export async function clear() {
-  await request(`${API_BASE}/recent`, { method: "DELETE" });
+  await request(`${apiBase()}/recent`, { method: "DELETE" });
 }

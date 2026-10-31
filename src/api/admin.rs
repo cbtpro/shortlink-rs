@@ -170,7 +170,11 @@ pub async fn delete_link(
 /// scheme 按 RFC 7235 大小写不敏感；格式不对一律视为「未提供」，
 /// 由用例层统一判 401，避免把「格式错误」和「未启用」混为一谈。
 fn bearer_token(request: &HttpRequest) -> Option<&str> {
-    let value = request.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let value = request
+        .headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let (scheme, token) = value.split_once(' ')?;
 
     if !scheme.eq_ignore_ascii_case("bearer") {

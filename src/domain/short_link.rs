@@ -12,6 +12,8 @@ use sqlx::FromRow;
 pub struct ShortLink {
     pub id: u64,
     pub code: String,
+    /// 归属用户。`None` 表示匿名创建（未登录时生成），只能靠访客 cookie 找回。
+    pub user_id: Option<u64>,
     pub long_url: String,
     pub created_at: NaiveDateTime,
     pub expire_at: Option<NaiveDateTime>,
@@ -39,10 +41,7 @@ impl ShortLink {
         if self.expire_at.is_some_and(|expire_at| expire_at <= now) {
             return LinkState::Expired;
         }
-        if self
-            .max_visits
-            .is_some_and(|max| self.visit_count >= max)
-        {
+        if self.max_visits.is_some_and(|max| self.visit_count >= max) {
             return LinkState::Exhausted;
         }
         LinkState::Active
@@ -116,7 +115,10 @@ impl AccessPolicy {
     }
 
     pub fn check(&self, request: &AccessRequest<'_>) -> Result<(), AccessDenial> {
-        if self.expire_at.is_some_and(|expire_at| expire_at <= request.now) {
+        if self
+            .expire_at
+            .is_some_and(|expire_at| expire_at <= request.now)
+        {
             return Err(AccessDenial::Expired);
         }
 
@@ -193,6 +195,7 @@ mod tests {
         ShortLink {
             id: 1,
             code: "abc".into(),
+            user_id: None,
             long_url: "https://example.com".into(),
             created_at: at(0),
             expire_at: None,
@@ -208,10 +211,7 @@ mod tests {
     #[test]
     fn rejects_expired_link() {
         let p = policy(Some(at(12)), None);
-        assert_eq!(
-            p.check(&request(at(13), None)),
-            Err(AccessDenial::Expired)
-        );
+        assert_eq!(p.check(&request(at(13), None)), Err(AccessDenial::Expired));
     }
 
     #[test]
@@ -238,10 +238,7 @@ mod tests {
         let p = policy(None, Some(3));
         let mut request = request(at(12), None);
         request.pending_visits = 3;
-        assert_eq!(
-            p.check(&request),
-            Err(AccessDenial::VisitLimitReached)
-        );
+        assert_eq!(p.check(&request), Err(AccessDenial::VisitLimitReached));
     }
 
     #[test]

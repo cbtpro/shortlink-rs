@@ -1,4 +1,5 @@
-import { $, delegate, h, setBusy } from "../core/dom.js";
+import { $, delegate, h, openInNewTab, setBusy } from "../core/dom.js";
+import { applySiteName } from "../core/config.js";
 import { formatNumber } from "../core/format.js";
 import { copyText } from "../core/clipboard.js";
 import { toast } from "../core/toast.js";
@@ -116,7 +117,13 @@ function buildRow(item) {
     h(
       "td",
       { class: "cell-code" },
-      h("a", { href: shortUrl, target: "_blank", rel: "noopener noreferrer", text: `/${item.code}` }),
+      h("a", {
+        href: shortUrl,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        onClick: openInNewTab,
+        text: `/${item.code}`,
+      }),
       item.has_password ? h("span", { class: "badge badge--locked", text: "密码" }) : null
     ),
     h("td", { class: "cell-url", title: item.long_url, text: item.long_url }),
@@ -133,7 +140,16 @@ function buildRow(item) {
       "td",
       { class: "cell-actions" },
       h("button", { type: "button", class: "row-action", text: "复制", onClick: () => copyLink(shortUrl) }),
-      h("button", { type: "button", class: "row-action", text: "打开", onClick: () => window.open(shortUrl, "_blank", "noopener") }),
+      // 用真链接而不是 window.open：新标签页是浏览器的默认行为，不会被弹窗拦截器吃掉，
+      // 也支持中键 / 右键「在新标签页中打开」。
+      h("a", {
+        class: "row-action",
+        href: shortUrl,
+        target: "_blank",
+        rel: "noopener noreferrer",
+        onClick: openInNewTab,
+        text: "打开",
+      }),
       deleteButton(item.code)
     )
   );
@@ -313,6 +329,8 @@ el.next.addEventListener("click", () => {
 });
 
 /* ---------- 启动 ---------- */
+
+applySiteName();
 
 const savedToken = sessionStorage.getItem(TOKEN_KEY);
 if (savedToken) {

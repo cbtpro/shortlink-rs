@@ -16,10 +16,14 @@ pub async fn redirect(
 ) -> Result<HttpResponse, AppError> {
     let code = path.into_inner();
 
-    match state.redirect.resolve(&code, query.password.as_deref()).await? {
+    match state
+        .redirect
+        .resolve(&code, query.password.as_deref())
+        .await?
+    {
         Landing::Direct(location) => Ok(HttpResponse::Found()
             .append_header((header::LOCATION, location))
             .finish()),
-        Landing::Interstitial(target) => Ok(interstitial::render(&code, &target)),
+        Landing::Interstitial(target) => Ok(interstitial::render(&state.assets, &code, &target)),
     }
 }

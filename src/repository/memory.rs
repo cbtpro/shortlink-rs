@@ -6,16 +6,16 @@ use std::sync::Mutex;
 use chrono::{NaiveDateTime, Utc};
 
 use super::{
-    CreationHistory, LinkFilter, LinkOverview, LinkPage, LinkQuery, LinkRepository,
-    OverviewWindow, RepoError,
+    CreationHistory, LinkFilter, LinkOverview, LinkPage, LinkQuery, LinkRepository, OverviewWindow,
+    RepoError, SessionRepository, UserRepository,
 };
+use crate::domain::account::{NewUser, User};
 use crate::domain::new_link::NewShortLink;
 use crate::domain::short_link::{LinkState, ShortLink};
 use crate::types::BoxFuture;
 
 struct Creation {
     code: String,
-    at: NaiveDateTime,
 }
 
 #[derive(Default)]
@@ -24,6 +24,10 @@ struct Inner {
     links: HashMap<String, ShortLink>,
     /// 访客 → 创建记录，按时间倒序保存
     creations: HashMap<String, Vec<Creation>>,
+    next_user_id: u64,
+    users: Vec<User>,
+    /// 令牌指纹 → (用户 id, 过期时刻)
+    sessions: HashMap<String, (u64, NaiveDateTime)>,
 }
 
 #[derive(Default)]
@@ -57,6 +61,7 @@ impl LinkRepository for InMemoryLinkRepository {
                 let stored = ShortLink {
                     id: inner.next_id,
                     code: code.to_string(),
+                    user_id: link.owner_id,
                     long_url: link.url.clone(),
                     created_at: Utc::now().naive_utc(),
                     expire_at: link.expire_at,
@@ -170,6 +175,70 @@ impl LinkRepository for InMemoryLinkRepository {
     fn delete_by_code<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<bool, RepoError>> {
         Box::pin(async move { self.with_inner(|inner| Ok(inner.links.remove(code).is_some())) })
     }
+
+    fn list_by_owner(
+        &self,
+        owner_id: u64,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<Vec<ShortLink>, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                let mut owned: Vec<&ShortLink> = inner
+                    .links
+                    .values()
+                    .filter(|link| link.user_id == Some(owner_id))
+                    .collect();
+                // 与 SQL 的 `ORDER BY created_at DESC, id DESC` 同序
+                owned.sort_by(|a, b| {
+                    b.created_at
+                        .cmp(&a.created_at)
+                        .then_with(|| b.id.cmp(&a.id))
+                });
+
+                Ok(owned
+                    .into_iter()
+                    .take(limit as usize)
+                    .cloned()
+                    .collect::<Vec<_>>())
+            })
+        })
+    }
+
+    fn delete_owned<'a>(
+        &'a self,
+        owner_id: u64,
+        code: &'a str,
+    ) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                // 归属不符与不存在返回同一个 false：调用方对两者都只能报 404
+                match inner.links.get(code) {
+                    Some(link) if link.user_id == Some(owner_id) => {
+                        inner.links.remove(code);
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            })
+        })
+    }
+
+    fn delete_all_owned(&self, owner_id: u64) -> BoxFuture<'_, Result<Vec<String>, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                let codes: Vec<String> = inner
+                    .links
+                    .values()
+                    .filter(|link| link.user_id == Some(owner_id))
+                    .map(|link| link.code.clone())
+                    .collect();
+
+                inner.links.retain(|_, link| link.user_id != Some(owner_id));
+
+                Ok(codes)
+            })
+        })
+    }
 }
 
 impl CreationHistory for InMemoryLinkRepository {
@@ -187,7 +256,6 @@ impl CreationHistory for InMemoryLinkRepository {
                     0,
                     Creation {
                         code: code.to_string(),
-                        at: Utc::now().naive_utc(),
                     },
                 );
                 entries.truncate(keep.max(1) as usize);
@@ -249,6 +317,99 @@ impl CreationHistory for InMemoryLinkRepository {
     }
 }
 
+impl UserRepository for InMemoryLinkRepository {
+    fn create<'a>(
+        &'a self,
+        new: &'a NewUser,
+        password_hash: &'a str,
+    ) -> BoxFuture<'a, Result<User, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                if inner.users.iter().any(|user| user.email == new.email) {
+                    return Err(RepoError::DuplicateEmail);
+                }
+
+                inner.next_user_id += 1;
+                let user = User {
+                    id: inner.next_user_id,
+                    email: new.email.clone(),
+                    display_name: new.resolve_display_name(),
+                    password_hash: password_hash.to_string(),
+                    created_at: Utc::now().naive_utc(),
+                };
+                inner.users.push(user.clone());
+                Ok(user)
+            })
+        })
+    }
+
+    fn find_by_email<'a>(
+        &'a self,
+        email: &'a str,
+    ) -> BoxFuture<'a, Result<Option<User>, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                Ok(inner.users.iter().find(|user| user.email == email).cloned())
+            })
+        })
+    }
+}
+
+impl SessionRepository for InMemoryLinkRepository {
+    fn create<'a>(
+        &'a self,
+        user_id: u64,
+        token_hash: &'a str,
+        expires_at: NaiveDateTime,
+    ) -> BoxFuture<'a, Result<(), RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                inner
+                    .sessions
+                    .insert(token_hash.to_string(), (user_id, expires_at));
+                Ok(())
+            })
+        })
+    }
+
+    fn find_user<'a>(
+        &'a self,
+        token_hash: &'a str,
+        now: NaiveDateTime,
+    ) -> BoxFuture<'a, Result<Option<User>, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                let Some((user_id, expires_at)) = inner.sessions.get(token_hash) else {
+                    return Ok(None);
+                };
+                if *expires_at <= now {
+                    return Ok(None);
+                }
+
+                Ok(inner.users.iter().find(|user| user.id == *user_id).cloned())
+            })
+        })
+    }
+
+    fn delete<'a>(&'a self, token_hash: &'a str) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(
+            async move { self.with_inner(|inner| Ok(inner.sessions.remove(token_hash).is_some())) },
+        )
+    }
+
+    fn purge_expired(&self, now: NaiveDateTime) -> BoxFuture<'_, Result<u64, RepoError>> {
+        Box::pin(async move {
+            self.with_inner(|inner| {
+                let before = inner.sessions.len();
+                inner
+                    .sessions
+                    .retain(|_, (_, expires_at)| *expires_at > now);
+                Ok((before - inner.sessions.len()) as u64)
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,8 +424,14 @@ mod tests {
     #[tokio::test]
     async fn assigns_increasing_ids() {
         let repository = InMemoryLinkRepository::new();
-        let first = repository.insert(&link("https://a.example"), "a").await.unwrap();
-        let second = repository.insert(&link("https://b.example"), "b").await.unwrap();
+        let first = repository
+            .insert(&link("https://a.example"), "a")
+            .await
+            .unwrap();
+        let second = repository
+            .insert(&link("https://b.example"), "b")
+            .await
+            .unwrap();
 
         assert_eq!(first.id, 1);
         assert_eq!(second.id, 2);
@@ -274,7 +441,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_duplicate_code() {
         let repository = InMemoryLinkRepository::new();
-        repository.insert(&link("https://a.example"), "dup").await.unwrap();
+        repository
+            .insert(&link("https://a.example"), "dup")
+            .await
+            .unwrap();
 
         let result = repository.insert(&link("https://b.example"), "dup").await;
         assert!(matches!(result, Err(RepoError::DuplicateCode)));
@@ -289,7 +459,10 @@ mod tests {
     #[tokio::test]
     async fn accumulates_visit_counts() {
         let repository = InMemoryLinkRepository::new();
-        repository.insert(&link("https://a.example"), "a").await.unwrap();
+        repository
+            .insert(&link("https://a.example"), "a")
+            .await
+            .unwrap();
 
         repository.add_visit_count("a", 2).await.unwrap();
         repository.add_visit_count("a", 3).await.unwrap();
@@ -310,7 +483,10 @@ mod tests {
     #[tokio::test]
     async fn saturates_instead_of_overflowing() {
         let repository = InMemoryLinkRepository::new();
-        repository.insert(&link("https://a.example"), "a").await.unwrap();
+        repository
+            .insert(&link("https://a.example"), "a")
+            .await
+            .unwrap();
 
         repository.add_visit_count("a", u32::MAX).await.unwrap();
         repository.add_visit_count("a", 1).await.unwrap();
@@ -336,7 +512,10 @@ mod tests {
     async fn lists_newest_first_with_pagination() {
         let repository = InMemoryLinkRepository::new();
         for code in ["a", "b", "c"] {
-            repository.insert(&link("https://example.com"), code).await.unwrap();
+            repository
+                .insert(&link("https://example.com"), code)
+                .await
+                .unwrap();
         }
 
         let first = repository
@@ -379,7 +558,10 @@ mod tests {
         let repository = InMemoryLinkRepository::new();
         let now = now();
 
-        repository.insert(&link("https://active.example"), "active").await.unwrap();
+        repository
+            .insert(&link("https://active.example"), "active")
+            .await
+            .unwrap();
 
         repository
             .insert(
@@ -405,20 +587,41 @@ mod tests {
         repository.add_visit_count("capped", 1).await.unwrap();
 
         let codes = |page: crate::repository::LinkPage| {
-            page.items.into_iter().map(|item| item.code).collect::<Vec<_>>()
+            page.items
+                .into_iter()
+                .map(|item| item.code)
+                .collect::<Vec<_>>()
         };
 
-        assert_eq!(codes(repository.list(&query(LinkFilter::All), now).await.unwrap()).len(), 3);
         assert_eq!(
-            codes(repository.list(&query(LinkFilter::Active), now).await.unwrap()),
+            codes(repository.list(&query(LinkFilter::All), now).await.unwrap()).len(),
+            3
+        );
+        assert_eq!(
+            codes(
+                repository
+                    .list(&query(LinkFilter::Active), now)
+                    .await
+                    .unwrap()
+            ),
             vec!["active"]
         );
         assert_eq!(
-            codes(repository.list(&query(LinkFilter::Expired), now).await.unwrap()),
+            codes(
+                repository
+                    .list(&query(LinkFilter::Expired), now)
+                    .await
+                    .unwrap()
+            ),
             vec!["expired"]
         );
         assert_eq!(
-            codes(repository.list(&query(LinkFilter::Exhausted), now).await.unwrap()),
+            codes(
+                repository
+                    .list(&query(LinkFilter::Exhausted), now)
+                    .await
+                    .unwrap()
+            ),
             vec!["capped"]
         );
     }
@@ -426,8 +629,14 @@ mod tests {
     #[tokio::test]
     async fn searches_code_and_url_ignoring_case() {
         let repository = InMemoryLinkRepository::new();
-        repository.insert(&link("https://example.com/Docs"), "Promo").await.unwrap();
-        repository.insert(&link("https://other.example"), "blog").await.unwrap();
+        repository
+            .insert(&link("https://example.com/Docs"), "Promo")
+            .await
+            .unwrap();
+        repository
+            .insert(&link("https://other.example"), "blog")
+            .await
+            .unwrap();
 
         let by_code = repository
             .list(
@@ -460,8 +669,14 @@ mod tests {
         let repository = InMemoryLinkRepository::new();
         let now = now();
 
-        repository.insert(&link("https://a.example"), "a").await.unwrap();
-        repository.insert(&link("https://b.example"), "b").await.unwrap();
+        repository
+            .insert(&link("https://a.example"), "a")
+            .await
+            .unwrap();
+        repository
+            .insert(&link("https://b.example"), "b")
+            .await
+            .unwrap();
         repository.add_visit_count("a", 4).await.unwrap();
         repository
             .insert(
@@ -492,10 +707,16 @@ mod tests {
     #[tokio::test]
     async fn deletes_existing_and_reports_missing() {
         let repository = InMemoryLinkRepository::new();
-        repository.insert(&link("https://a.example"), "gone").await.unwrap();
+        repository
+            .insert(&link("https://a.example"), "gone")
+            .await
+            .unwrap();
 
         assert!(repository.delete_by_code("gone").await.unwrap());
         assert!(repository.find_by_code("gone").await.unwrap().is_none());
-        assert!(!repository.delete_by_code("gone").await.unwrap(), "重复删除返回 false");
+        assert!(
+            !repository.delete_by_code("gone").await.unwrap(),
+            "重复删除返回 false"
+        );
     }
 }

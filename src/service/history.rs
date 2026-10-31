@@ -111,13 +111,18 @@ mod tests {
         create(&repository, "yours").await;
 
         service.record(VISITOR, "mine").await.unwrap();
-        service.record("ffffffffffffffffffffffffffffffff", "yours")
+        service
+            .record("ffffffffffffffffffffffffffffffff", "yours")
             .await
             .unwrap();
 
         assert_eq!(service.recent(VISITOR).await.unwrap().len(), 1);
         assert_eq!(
-            service.recent("ffffffffffffffffffffffffffffffff").await.unwrap()[0].code,
+            service
+                .recent("ffffffffffffffffffffffffffffffff")
+                .await
+                .unwrap()[0]
+                .code,
             "yours"
         );
     }
@@ -142,7 +147,10 @@ mod tests {
         }
 
         assert!(service.forget(VISITOR, "a").await.unwrap());
-        assert!(!service.forget(VISITOR, "a").await.unwrap(), "重复删除返回 false");
+        assert!(
+            !service.forget(VISITOR, "a").await.unwrap(),
+            "重复删除返回 false"
+        );
 
         assert_eq!(service.clear(VISITOR).await.unwrap(), 1);
         assert!(service.recent(VISITOR).await.unwrap().is_empty());
