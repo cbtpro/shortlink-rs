@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>shortlink</title>
+    <meta name="description" content="把长网址转换成短链接，支持自定义短码、有效期、访问次数上限与密码。" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="assets/css/base.css" />
+    <link rel="stylesheet" href="assets/css/home.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="masthead">
+        <div class="brand">
+          <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+            <rect width="32" height="32" rx="4" fill="#b4471f" />
+            <path
+              d="M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2"
+              stroke="#fff"
+              stroke-width="2"
+              stroke-linecap="round"
+              fill="none"
+            />
+          </svg>
+          <span class="brand__name">shortlink</span>
+        </div>
+        <h1>短链接生成</h1>
+        <p class="lead">
+          贴上长网址生成短链。可以指定短码、有效期、访问次数上限和密码，不需要注册。
+        </p>
+      </header>
+
+      <main>
+        <section class="panel" aria-labelledby="form-title">
+          <h2 id="form-title" class="visually-hidden">创建短链</h2>
+
+          <form id="create-form" novalidate>
+            <div class="field">
+              <label for="url">目标地址</label>
+              <input
+                id="url"
+                name="url"
+                type="url"
+                inputmode="url"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="https://example.com/a/very/long/path?with=query"
+                required
+              />
+              <p class="field__hint">需要带 http:// 或 https:// 前缀。</p>
+            </div>
+
+            <div class="field">
+              <label for="code">自定义短码<span class="field__optional">可选</span></label>
+              <input
+                id="code"
+                name="code"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                maxlength="10"
+                pattern="[A-Za-z0-9_-]+"
+                placeholder="留空则随机生成"
+              />
+              <p class="field__hint">1 到 10 位，字母、数字、<code>-</code>、<code>_</code>。</p>
+            </div>
+
+            <details class="advanced">
+              <summary>更多选项</summary>
+              <div class="advanced__body">
+                <div class="field">
+                  <label for="expire">有效期至</label>
+                  <input id="expire" name="expire" type="datetime-local" />
+                  <p class="field__hint">留空则长期有效，按本地时间算。</p>
+                </div>
+
+                <div class="field">
+                  <label for="max-visits">访问次数上限</label>
+                  <input id="max-visits" name="maxVisits" type="number" min="1" step="1" inputmode="numeric" placeholder="不限" />
+                  <p class="field__hint">达到上限后返回 410。</p>
+                </div>
+
+                <div class="field">
+                  <label for="password">访问密码</label>
+                  <input id="password" name="password" type="text" autocomplete="off" spellcheck="false" placeholder="不设密码" />
+                  <p class="field__hint">访问时需带上 <code>?password=</code>。</p>
+                </div>
+
+                <div class="field field--check">
+                  <label for="interstitial">
+                    <input id="interstitial" name="interstitial" type="checkbox" />
+                    <span>先显示中转页</span>
+                  </label>
+                  <p class="field__hint">访问者先看到目标地址，确认后再跳转。</p>
+                </div>
+              </div>
+            </details>
+
+            <p class="form-error" id="form-error" role="alert" hidden></p>
+
+            <button class="button button--primary" type="submit" id="submit">
+              <span class="button__label">生成</span>
+              <span class="spinner" aria-hidden="true"></span>
+            </button>
+          </form>
+
+          <section class="result" id="result" hidden aria-live="polite">
+            <div class="result__head">
+              <span class="result__badge">已生成</span>
+              <span class="result__code" id="result-code"></span>
+            </div>
+            <a class="result__url" id="result-url" href="#" target="_blank" rel="noopener noreferrer"></a>
+            <p class="result__meta" id="result-meta"></p>
+            <p class="result__warn" id="result-warn" hidden></p>
+            <div class="result__actions">
+              <button class="button button--primary" type="button" id="copy-result">复制</button>
+              <a class="button" id="open-result" href="#" target="_blank" rel="noopener noreferrer">打开</a>
+            </div>
+          </section>
+        </section>
+
+        <section class="recent" aria-labelledby="recent-title">
+          <div class="recent__head">
+            <h2 id="recent-title">最近创建</h2>
+            <button class="link-button" type="button" id="clear-recent" hidden>清空</button>
+          </div>
+          <ul class="recent__list" id="recent-list"></ul>
+          <p class="recent__empty" id="recent-empty">
+            还没有记录。创建过的短链会记在这个浏览器下。
+          </p>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span>记录按浏览器匿名保存</span>
+        <span class="footer__sep">·</span>
+        <a href="/admin">管理后台</a>
+      </footer>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="assets/js/pages/home.js"></script>
+  </body>
+</html>

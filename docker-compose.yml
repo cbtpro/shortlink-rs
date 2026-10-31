@@ -1,0 +1,92 @@
+# 本地基础设施编排：MySQL + Redis
+#
+# 只负责「项目依赖的中间件」，不包含应用本身（应用仍用 cargo run 直跑，
+# 保留热重载体验）。所有可调参数都走环境变量，默认值可直接用：
+#
+#   docker compose up -d
+#
+# 首次启动时 MySQL 会自动执行 talbe.sql 建表（仅当数据卷为空时执行）。
+
+name: shortlink-rs
+
+services:
+  mysql:
+    image: mysql:${MYSQL_VERSION:-8.4}
+    container_name: shortlink-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-short_link}
+      MYSQL_USER: ${MYSQL_USER:-short_link}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-short_link}
+      TZ: ${TZ:-Asia/Shanghai}
+    # 字符集与业务表对齐（utf8mb4），时区固定东八区，
+    # 否则 TIMESTAMP 字段的读写会随容器默认 UTC 漂移 8 小时。
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+      - --max-connections=200
+    ports:
+      # 默认只监听回环地址：MySQL 暴露到 0.0.0.0 是常见的入侵入口。
+      # 需要用图形客户端从别的机器连，把 MYSQL_BIND 改成 0.0.0.0。
+      - "${MYSQL_BIND:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 建表脚本直接复用仓库里的 talbe.sql，避免出现第二份 schema 定义。
+      # docker-entrypoint-initdb.d 只在数据目录为空时执行，重建需先删卷。
+      - ./talbe.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      # 用 127.0.0.1 而非 localhost：初始化阶段官方镜像只开 socket，
+      # 走 TCP 探测能确保「初始化脚本跑完」才算健康。
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    networks:
+      - shortlink-net
+
+  redis:
+    image: redis:${REDIS_VERSION:-7.4-alpine}
+    container_name: shortlink-redis
+    restart: unless-stopped
+    # appendonly：访问计数是「先写 Redis、后台回刷」的，进程重启不能丢。
+    # noeviction：计数 key 被内存策略淘汰会让访问量凭空归零，
+    #             宁可写入失败也不能静默丢弃。
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "${REDIS_BIND:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - shortlink-net
+
+volumes:
+  # 显式命名，避免随 compose 项目名变化而"看似丢数据"。
+  mysql-data:
+    name: shortlink-mysql-data
+  redis-data:
+    name: shortlink-redis-data
+
+networks:
+  shortlink-net:
+    name: shortlink-net
+    driver: bridge

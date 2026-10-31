@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <!-- 目标站点不该拿到「谁点了这条短链」的来源信息 -->
+    <meta name="referrer" content="no-referrer" />
+    <title>即将前往 {{host}} · shortlink</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="assets/css/base.css" />
+    <link rel="stylesheet" href="assets/css/interstitial.css" />
+  </head>
+  <body>
+    <main class="gate">
+      <p class="gate__kicker">中转页</p>
+      <h1>即将离开 shortlink</h1>
+      <p class="gate__lead">
+        这条短链指向下面的地址。目标站点与本服务无关，确认后再继续。
+      </p>
+
+      <p class="gate__host">{{host}}</p>
+      <p class="gate__url">{{url}}</p>
+
+      <div class="gate__actions">
+        <a class="button button--primary" href="{{url}}" rel="noopener noreferrer">继续访问</a>
+        <a class="button" href="./">返回首页</a>
+      </div>
+
+      <p class="gate__foot">短码 <code>{{code}}</code></p>
+    </main>
+  </body>
+</html>

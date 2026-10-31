@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>管理后台 · shortlink</title>
+    <meta name="robots" content="noindex, nofollow" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="assets/css/base.css" />
+    <link rel="stylesheet" href="assets/css/admin.css" />
+  </head>
+  <body>
+    <div class="admin">
+      <header class="topbar">
+        <a class="topbar__brand" href="/">
+          <svg class="topbar__mark" viewBox="0 0 32 32" aria-hidden="true">
+            <rect width="32" height="32" rx="4" fill="#b4471f" />
+            <path
+              d="M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2"
+              stroke="#fff"
+              stroke-width="2"
+              stroke-linecap="round"
+              fill="none"
+            />
+          </svg>
+          <span>shortlink</span>
+          <span class="topbar__tag">后台</span>
+        </a>
+
+        <div class="topbar__actions" id="topbar-actions" hidden>
+          <button class="button button--ghost" type="button" id="sign-out">退出</button>
+        </div>
+      </header>
+
+      <section class="gate" id="gate" hidden>
+        <h1>管理后台</h1>
+        <p class="gate__lead">
+          输入服务端配置的 <code>ADMIN_TOKEN</code>。只保存在当前标签页，关掉即失效。
+        </p>
+
+        <form id="gate-form" novalidate>
+          <label class="gate__label" for="token">访问口令</label>
+          <input
+            id="token"
+            name="token"
+            type="password"
+            autocomplete="current-password"
+            placeholder="ADMIN_TOKEN"
+            spellcheck="false"
+          />
+          <p class="gate__error" id="gate-error" role="alert" hidden></p>
+          <button class="button button--primary" type="submit" id="gate-submit">
+            <span class="button__label">进入</span>
+            <span class="spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+      </section>
+
+      <main id="console" hidden>
+        <section class="stats" aria-label="概览">
+          <article class="stat">
+            <span class="stat__label">总链接</span>
+            <strong class="stat__value" id="stat-total">—</strong>
+          </article>
+          <article class="stat">
+            <span class="stat__label">总访问</span>
+            <strong class="stat__value" id="stat-visits">—</strong>
+            <span class="stat__hint">已回刷到库</span>
+          </article>
+          <article class="stat">
+            <span class="stat__label">今日新增</span>
+            <strong class="stat__value" id="stat-today">—</strong>
+          </article>
+          <article class="stat">
+            <span class="stat__label">7 天内到期</span>
+            <strong class="stat__value" id="stat-expiring">—</strong>
+          </article>
+        </section>
+
+        <section class="board" aria-labelledby="board-title">
+          <h2 class="visually-hidden" id="board-title">短链列表</h2>
+
+          <div class="toolbar">
+            <input
+              class="toolbar__search"
+              id="search"
+              type="search"
+              placeholder="搜索短码或目标地址"
+              autocomplete="off"
+              spellcheck="false"
+            />
+
+            <div class="segmented" id="filters" role="group" aria-label="按状态筛选">
+              <button class="segmented__item segmented__item--on" type="button" data-status="all">全部</button>
+              <button class="segmented__item" type="button" data-status="active">有效</button>
+              <button class="segmented__item" type="button" data-status="expired">已过期</button>
+              <button class="segmented__item" type="button" data-status="exhausted">已达上限</button>
+            </div>
+
+            <button class="button button--ghost" type="button" id="refresh">刷新</button>
+          </div>
+
+          <p class="board__error" id="board-error" role="alert" hidden></p>
+
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th scope="col">短码</th>
+                  <th scope="col">目标地址</th>
+                  <th scope="col" class="table__num">访问</th>
+                  <th scope="col">状态</th>
+                  <th scope="col">创建</th>
+                  <th scope="col">有效期</th>
+                  <th scope="col"><span class="visually-hidden">操作</span></th>
+                </tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+
+          <p class="empty" id="empty" hidden>没有匹配的短链。</p>
+
+          <footer class="pager">
+            <span class="pager__info" id="pager-info"></span>
+            <div class="pager__actions">
+              <button class="button button--ghost" type="button" id="prev">上一页</button>
+              <button class="button button--ghost" type="button" id="next">下一页</button>
+            </div>
+          </footer>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <script type="module" src="assets/js/pages/admin.js"></script>
+  </body>
+</html>

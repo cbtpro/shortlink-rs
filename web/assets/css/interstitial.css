@@ -1,0 +1,81 @@
+/* 中转页样式。控件与配色来自 base.css，这里只排这一张提示页。 */
+
+.gate {
+  width: min(100% - 40px, 460px);
+  margin: 0 auto;
+  padding: 72px 0 48px;
+}
+
+.gate__kicker {
+  margin: 0 0 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+}
+
+.gate h1 {
+  margin: 0 0 8px;
+  font-size: 21px;
+  line-height: 1.4;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.gate__lead {
+  margin: 0;
+  max-width: 40ch;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 目标站点是这一页的主角，给足重量 */
+.gate__host {
+  margin: 22px 0 0;
+  padding: 12px 14px 11px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
+.gate__url {
+  margin: 7px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+  word-break: break-all;
+}
+
+.gate__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.gate__foot {
+  margin: 26px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.gate__foot code {
+  font-family: var(--font-mono);
+  background: var(--surface-soft);
+  border-radius: var(--radius-sm);
+  padding: 1px 4px;
+}
+
+@media (max-width: 560px) {
+  .gate {
+    width: min(100% - 24px, 460px);
+    padding-top: 48px;
+  }
+}
