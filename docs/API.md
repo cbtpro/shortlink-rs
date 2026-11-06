@@ -4,7 +4,7 @@
 
 - 基地址：`PUBLIC_BASE_URL`（默认 `http://127.0.0.1:8080`，开发档为 `:9981`）
 - 请求与响应均为 `application/json`（跳转接口除外）
-- `GET /` 是操作界面（单页），`GET /login` 是登录 / 注册页，`GET /admin` 是管理后台；资源集中在
+- `GET /` 是操作界面（单页），`GET /login` 是登录 / 注册页，`GET /admin` 是后台；资源集中在
   `GET /assets/{path}`（样式与 ES 模块，清单由 `build.rs` 扫描 `web/` 自动生成），另有
   `/favicon.ico`（204），全部注册在 `/{code}` 兜底路由之前；前端源码在 `web/`，无构建步骤
 - 前端启动时会加载 `GET /app-config.js`（运行时配置），运维用 `GET /healthz`、`GET /readyz`，
@@ -142,7 +142,17 @@ curl -i -b cookies.txt -X POST http://127.0.0.1:9981/auth/logout
 探测当前登录态，前端启动时调一次。
 
 ```json
-{ "user": { "id": 7, "email": "me@example.com", "display_name": "小明", "created_at": "2026-11-01 01:20:11" } }
+{
+  "user": {
+    "id": 7,
+    "email": "me@example.com",
+    "display_name": "小明",
+    "role": "user",
+    "status": "active",
+    "must_change_password": false,
+    "created_at": "2026-11-01 01:20:11"
+  }
+}
 ```
 
 未登录（或会话已失效）时同样返回 `200`，只是 `user` 为 `null`：
@@ -154,6 +164,49 @@ curl -i -b cookies.txt -X POST http://127.0.0.1:9981/auth/logout
 不用 `401` 是有意的：这个接口的语义是「现在是谁」，「没人」是一个正常答案。
 存储故障会如实返回 `500`，而不是假装成未登录 —— 后者会让人以为莫名掉线了。
 响应头带 `Cache-Control: no-store`：内容随 cookie 变化，任何缓存层存下来都会串号。
+
+| 字段 | 说明 |
+| --- | --- |
+| `role` | `admin` / `user`。前端据此决定画不画用户页，**权限判断在服务端** |
+| `status` | `active` / `disabled`。被停用的账号会话会立刻消失，通常只会看到 `user: null` |
+| `must_change_password` | 为真时除了 `POST /auth/password`，其他接口一律 403 |
+
+## POST /auth/password
+
+自助改密。也是**临时口令的唯一出口**：管理员重置、初始化生成的口令，
+在改掉之前其他接口都会被挡回来。
+
+```json
+{ "current_password": "old-secret", "new_password": "new-secret" }
+```
+
+成功 `200`，响应体与登录一致（带 `user`），并下发一枚新的 `sl_session`：
+
+```json
+{
+  "user": {
+    "id": 7,
+    "email": "me@example.com",
+    "display_name": "小明",
+    "role": "user",
+    "status": "active",
+    "must_change_password": false,
+    "created_at": "2026-11-01 01:20:11"
+  }
+}
+```
+
+- 改密后**该账号的会话全部作废**，只有发起这次请求的设备拿到新 cookie；
+  别处登录过的标签页会在下一次请求时收到 401；
+- 初始化管理员改完密码后，磁盘上那份一次性口令文件立即删除；
+- 新口令规则与注册一致（8–128 位）。
+
+| 状态码 | `message` | 触发条件 |
+| --- | --- | --- |
+| 400 | `password must be at least 8 characters` | 新口令太短 |
+| 400 | `new password must differ from the current one` | 新旧口令相同 |
+| 401 | `unauthorized` | 没有会话 |
+| 401 | `email or password is incorrect` | 当前口令不对（与登录同一套文案，避免区分「谁错了」） |
 
 ## POST /shorten
 
@@ -260,6 +313,7 @@ curl -X POST http://127.0.0.1:9981/shorten \
 | --- | --- | --- | --- |
 | `code` | path | 是 | 短码 |
 | `password` | query | 条件 | 链接设置了密码时必填 |
+| `confirm` | query | 否 | 中转页「继续访问」带回来的票据，由服务端签发，调用方不自己构造 |
 
 ```bash
 curl -i http://127.0.0.1:9981/promo
@@ -282,23 +336,51 @@ Location: https://example.com/demo
 由访问者点击「继续访问」进入目标。页面没有脚本，目标地址经 HTML 转义后渲染，
 并以 `Referrer-Policy: no-referrer` 输出，目标站点拿不到来源信息。
 
-注意两点：
+注意三点：
 
-- **打开中转页就算一次访问**，点「继续访问」不重复计数；
-- 中转页只是展示方式，密码、过期、次数上限等规则照常生效（先鉴权，后出页面）。
+- **打开中转页不计入访问次数**。确认页只是给人看的，到这一步访问者还没到目标；
+  页面上的「继续访问」指向 `/{code}?confirm=<票据>`，点下去才算一次跳转、计一次数。
+- **票据是一次性的**：有效期 10 分钟，兑换即失效，只对签发它的短码有效。
+  票据过期或被重放时会退回中转页（或有密码时的密码页），不会直接放行。
+- 中转页只是展示方式，密码、过期、次数上限等规则照常生效 —— 点「继续访问」时
+  还会再复检一次过期与上限，因为访问者可能在确认页停留很久。
+
+> Redis 不可用时签不出票据，此时「继续访问」直连目标地址：页面照样能用，
+> 只是这一次跳转统计不到 —— 和「计数本来就存在 Redis 里」是同一层降级。
 
 计数在返回 302 之后异步写入 Redis，因此「先跳转成功、计数稍后才可见」是正常现象；
-后台任务每 `VISIT_FLUSH_INTERVAL_SECONDS`（默认 300 秒）批量回刷到 MySQL。
+后台任务每 `VISIT_FLUSH_INTERVAL_SECONDS`（默认 60 秒）批量回刷到 MySQL，
+进程启动时也会先补一次，避免上一次退出前攒下的增量一直留在 Redis 里。
+
+**列表接口把两段账合起来了**：`GET /console/api/links` 返回的 `visit_count` 是
+「库里已回刷的 + Redis 里还没回刷的」，所以刚点完链接回后台就能看到新数字。
+概览的 `total_visits` 仍然是库里的汇总，最多落后一个回刷周期。
 
 ### 错误
 
-| 状态码 | `message` | 触发条件 |
+跳转失败时返回的**响应体是 HTML 页面**（`text/html; charset=utf-8`，
+`Cache-Control: no-store`），不是 JSON —— 点开短链的是浏览器里的人，
+页面上写明原因与下一步；状态码保持语义不变，供缓存、爬虫和监控使用。
+
+| 状态码 | 页面标题 | 触发条件 |
 | --- | --- | --- |
-| 404 | `short link not found` | 短码不存在 |
-| 403 | `password is required` | 链接有密码，但请求未带 `password` |
-| 403 | `invalid password` | 密码不匹配 |
-| 410 | `short link has expired` | 已过 `expire_at` |
-| 410 | `visit limit exceeded` | 已达到 `max_visits` |
+| 404 | 没有找到这个短码 | 短码不存在 |
+| 403 | 请输入访问密码 | 链接有密码，但请求未带 `password` |
+| 403 | 密码不正确 | 密码不匹配 |
+| 410 | 这条短链已经过期 | 已过 `expire_at` |
+| 410 | 访问次数已达上限 | 已达到 `max_visits` |
+
+需要密码与密码错误两种页面带**密码表单**。表单用 `POST` 提交到当前地址，
+密码走请求体，不进 URL、浏览器历史和 Referer；正确时返回 `303 See Other`
+（`Location` 指向目标），浏览器随即以 GET 前往目标站点。
+
+```bash
+curl -i -X POST -d 'password=123456' http://127.0.0.1:9981/promo
+# 303 See Other  Location: https://example.com/demo
+```
+
+`GET /{code}?password=` 仍然有效，便于把密码直接拼在分享链接里；
+但推荐用表单提交，密码不落 URL。
 
 ## 最近创建
 
@@ -361,19 +443,34 @@ Location: https://example.com/demo
 - **未登录**：清空本浏览器的清单；本来就没有记录同样返回 `204`。
 - **已登录**：删掉账号下的全部短链，逐条清缓存。语义见本节开头的对照表。
 
-## 后台管理接口
+## 后台接口
 
-页面在 `GET /admin`（源码 `web/admin.html`），数据接口都在 `/admin/api/*` 下。
+页面在 `GET /admin`（源码 `web/admin.html`），数据接口分两组：
 
-**启用方式**：`.env` 配置 `ADMIN_TOKEN`（至少 8 个字符，留空则后台关闭，
-所有 `/admin*` 路由返回 404 —— 连「有后台」这件事都不暴露）。
+| 前缀 | 用途 | 谁能调 |
+| --- | --- | --- |
+| `/console/api/*` | 概览、短链列表、删除 | 任何登录用户；能看多少由角色决定 |
+| `/admin/api/users*` | 账号列表、重置密码、启用禁用 | 仅管理员 |
 
-**鉴权**：除页面本身外，所有请求带 `Authorization: Bearer <ADMIN_TOKEN>`，
-否则 401。口令比较为常量时间实现。
+**鉴权**：与其余业务接口完全一致 —— `sl_session` cookie。后台没有专用口令：
+多一套凭据就多一处能泄漏的地方，也说不清「谁在操作」。
 
-### GET /admin/api/overview
+| 情况 | 响应 |
+| --- | --- |
+| 没有会话、会话已失效 | `401 unauthorized` |
+| 账号被停用 | `403 account is disabled` |
+| 临时口令未更换 | `403 password must be changed before continuing` |
+| 非管理员访问 `/admin/api/users*` | `403 administrator privileges required` |
 
-概览统计。
+**作用域**在用例层固定（`service::console::scope_of`），不靠每个 handler 记得判断：
+
+- 普通用户的查询被强制加上「归属 = 自己」，手工传 `owner=<别人>` 也会被覆盖；
+- 删除走「归属匹配」的 SQL：别人的短链与不存在的短链**都是 404**，
+  不区分才能不泄漏「这个短码存在、只是不属于你」。
+
+### GET /console/api/overview
+
+概览统计。普通用户拿到的是自己名下的数字，管理员是全站。
 
 ```json
 {
@@ -384,11 +481,12 @@ Location: https://example.com/demo
 }
 ```
 
-- `total_visits` 只含**已回刷到库**的访问，最近几分钟的增量不计入；
+- `total_visits` 只含**已回刷到库**的访问，最多落后一个回刷周期（默认 60 秒）；
+  需要精确到当前刻的数字请看列表接口的 `visit_count`；
 - `created_today` 按服务器本地日历的「今天」划分；
 - `expiring_soon` 为未来 7 天内到期的链接数。
 
-### GET /admin/api/links
+### GET /console/api/links
 
 分页列表，按创建时间倒序。
 
@@ -396,8 +494,9 @@ Location: https://example.com/demo
 | --- | --- | --- |
 | `page` | `1` | 从 1 开始 |
 | `size` | `20` | 上限 100，超出按 100 处理 |
-| `q` | — | 模糊匹配短码与目标地址（大小写不敏感，`%`/`_` 会被转义） |
+| `q` | — | 模糊匹配短码与目标地址（大小写不敏感，`%`/`_` 会被转义），最长 100 字符 |
 | `status` | `all` | `all` / `active` / `expired` / `exhausted`，其他值按 `all` |
+| `owner` | — | 只看某个用户。**仅管理员有效**，普通用户传了会被覆盖 |
 
 ```json
 {
@@ -410,7 +509,12 @@ Location: https://example.com/demo
       "max_visits": 100,
       "visit_count": 3,
       "has_password": false,
-      "state": "active"
+      "state": "active",
+      "owner": {
+        "id": 7,
+        "email": "me@example.com",
+        "display_name": "小明"
+      }
     }
   ],
   "page": 1,
@@ -423,21 +527,106 @@ Location: https://example.com/demo
 时间字段为本地时间；`state` 的判定与跳转时的规则完全一致
 （`domain::short_link::state`，有测试锁住两者不漂移）。
 
-### DELETE /admin/api/links/{code}
+`owner` 为 `null` 有两种情况：匿名创建的链接，或普通用户看自己的列表
+（每一条都是自己的，带上归属只是噪音）。
+
+### DELETE /console/api/links/{code}
 
 删除短链，成功返回 `204`。
 
+- 管理员可删任意一条，普通用户只能删自己名下的；
 - 删除后立即 404，缓存同步清理；
 - 该短码尚未回刷的访问计数会被**丢弃**（记录已不存在，保留只会无限重试）；
-- 删除不存在的短码返回 404。
+- 不存在或不属于你，都返回 `404 short link not found`。
+
+### GET /admin/api/users
+
+用户列表（仅管理员），按 id 倒序。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `page` | `1` | 从 1 开始 |
+| `size` | `20` | 上限 100 |
+| `q` | — | 模糊匹配邮箱与昵称 |
+
+```json
+{
+  "items": [
+    {
+      "id": 7,
+      "email": "me@example.com",
+      "display_name": "小明",
+      "role": "user",
+      "status": "active",
+      "must_change_password": false,
+      "link_count": 12,
+      "created_at": "2026-11-01 01:20:11"
+    }
+  ],
+  "page": 1,
+  "page_size": 20,
+  "total": 11,
+  "total_pages": 1
+}
+```
+
+`link_count` 由一次 `LEFT` 子查询带出，不额外发请求。**不含 `password_hash`** ——
+字段列表本身就是白名单。
+
+### POST /admin/api/users/{id}/password
+
+把目标账号的口令重置为一个随机的一次性口令，并置 `must_change_password`。
+
+```json
+{ "email": "me@example.com", "password": "Fymqzq8PLNvXZapA" }
+```
+
+- 明文口令**只在这个响应里出现一次**，库里存的是散列，服务端不留副本；
+- 响应带 `Cache-Control: no-store`，代理与浏览器都不会缓存；
+- 目标账号的会话全部作废（否则「重置」只是多了一个能用的口令）；
+- 对方用一次性口令登录后，必须先改密才能用其他接口。
+
+| 状态码 | `message` | 触发条件 |
+| --- | --- | --- |
+| 403 | `administrator privileges required` | 不是管理员 |
+| 403 | `administrator accounts can only be managed by themselves` | 目标是管理员 |
+| 403 | `cannot manage your own account from the console` | 目标是自己 |
+| 404 | `user not found` | id 不存在 |
+
+### POST /admin/api/users/{id}/status
+
+启用 / 停用。
+
+```json
+{ "status": "disabled" }
+```
+
+成功 `200`：
+
+```json
+{ "id": 7, "status": "disabled" }
+```
+
+- 只接受 `active` / `disabled`，其他值一律 `400 request body is not valid` ——
+  拼错的状态不能被当成「禁用」，那会让一次手滑停掉别人的号；
+- 显式给出目标状态而不是 toggle：两个管理员同时点，toggle 会各自反转，最后是什么状态说不清；
+- **停用即刻生效**：该账号的会话先被删掉，且会话查询本身带 `u.status = 'active'`，
+  即便漏删也进不来；
+- 与重置密码相同的三条边界（非管理员 403、管理员账号、自己）。
 
 ### 后台接口错误
 
 | 状态码 | `message` | 触发条件 |
 | --- | --- | --- |
-| 401 | `unauthorized` | 缺少 `Authorization`、格式不对或口令不匹配 |
-| 404 | `admin api is disabled` | 未配置 `ADMIN_TOKEN` |
-| 404 | `short link not found` | 删除时短码不存在 |
+| 401 | `unauthorized` | 没有会话或会话已失效 |
+| 403 | `account is disabled` | 账号被停用 |
+| 403 | `password must be changed before continuing` | 临时口令未更换 |
+| 403 | `administrator privileges required` | 非管理员调账号管理接口 |
+| 403 | `cannot change the status of your own account` | 管理员停用自己 |
+| 403 | `cannot manage your own account from the console` | 管理员重置自己的口令 |
+| 403 | `administrator accounts can only be managed by themselves` | 动另一个管理员 |
+| 404 | `short link not found` | 删除时短码不存在或不属于你 |
+| 404 | `user not found` | 目标账号不存在 |
 
 ## 运行时与运维接口
 
@@ -455,7 +644,7 @@ Cache-Control: no-store
 
 ```js
 // generated by the server, do not edit
-window.__APP_CONFIG__ = {"env":"development","siteName":"shortlink","apiBase":"","adminEnabled":true,"liveReload":true,"assetsStamp":"d8c553eddf829bab"};
+window.__APP_CONFIG__ = {"env":"development","siteName":"shortlink","apiBase":"","liveReload":true,"assetsStamp":"d8c553eddf829bab"};
 ```
 
 | 字段 | 说明 |
@@ -463,7 +652,6 @@ window.__APP_CONFIG__ = {"env":"development","siteName":"shortlink","apiBase":""
 | `env` | 当前 `APP_ENV` |
 | `siteName` | 站点名，来自 `SITE_NAME` |
 | `apiBase` | 接口前缀；反代到子路径时形如 `/sub`，同源部署为空串 |
-| `adminEnabled` | 是否配置了 `ADMIN_TOKEN` |
 | `liveReload` | 是否注入自动刷新脚本（仅开发档为 true） |
 | `assetsStamp` | 资源指纹，排查「浏览器用了旧资源」时对一下 |
 
@@ -508,13 +696,13 @@ window.__APP_CONFIG__ = {"env":"development","siteName":"shortlink","apiBase":""
 | 200 | 请求成功 | `POST /auth/login`、`GET /recent`、`GET /auth/me` |
 | 200 | 中转确认页 | `GET /{code}`，链接开启 `interstitial` 时 |
 | 201 | 创建成功 | `POST /shorten`、`POST /auth/register` |
-| 204 | 成功但无内容 | `POST /auth/logout`、`DELETE /admin/api/links/{code}`、`DELETE /recent*` |
+| 204 | 成功但无内容 | `POST /auth/logout`、`DELETE /console/api/links/{code}`、`DELETE /recent*` |
 | 302 | 跳转 | `GET /{code}` |
 | 304 | 资源未变化 | `GET /assets/**` 带 `If-None-Match` 命中 |
 | 400 | 参数不合法 | URL 协议不对、短码非法、次数越界、日期在过去、邮箱或口令不合规、请求体解析失败 |
-| 401 | 凭据无效 | 缺少或错误的 Bearer token；登录失败（邮箱与口令不区分） |
-| 403 | 缺少或错误的密码 | 受保护链接 |
-| 404 | 不存在 / 未启用 / 端点关闭 | 拼错短码；删别人的链接；未配置 `ADMIN_TOKEN`；生产访问 `/__dev/*` |
+| 401 | 凭据无效 | 没有会话或会话已失效；登录失败、当前口令不对（邮箱与口令不区分） |
+| 403 | 拒绝访问 | 受保护链接的密码不对；账号被停用；临时口令未更换；需要管理员 |
+| 404 | 不存在 / 端点关闭 | 拼错短码；删别人的链接（不区分越权与不存在）；目标账号不存在；生产访问 `/__dev/*` |
 | 409 | 冲突 | 自定义短码重复；邮箱已注册 |
 | 410 | 资源已失效 | 过期、次数用尽 |
 | 500 | 服务端故障 | 数据库/Redis 不可用、短码分配失败 |
@@ -526,8 +714,10 @@ window.__APP_CONFIG__ = {"env":"development","siteName":"shortlink","apiBase":""
   但当前不影响跳转结果 —— 实现前不要依赖它做访问控制。
 - 链接的**访问密码是明文比较**，与账号口令的 PBKDF2 不是一套；仅适用于内部或低风险场景。
 - 创建短链不要求登录：任何能访问服务的人都能建链，只是登录后才归属到账号。
-  后台接口有 `ADMIN_TOKEN` 保护，但令牌经 `Authorization` 头明文传输，仅在 HTTPS 或内网环境下使用。
-- 没有邮箱验证、找回密码、改密码与注销账号的入口。
+- 后台的权限完全由 `users.role` 决定：能改库的人就能把自己改成管理员。
+  没有「提升为管理员」的接口是有意的 —— 那等于给最高权限开了个 HTTP 入口。
+- 没有邮箱验证与找回密码：忘记口令只能请管理员重置成一次性口令。
+- 没有注销账号的入口：删行请直接改库（`user_sessions` / `short_links` 外键级联）。
 - 没有按账号的配额与频率限制：`POST /auth/register` 可被批量调用，`POST /auth/login` 也没有
   失败次数锁定。生产部署应在反向代理层加限流。
 - 匿名链接不能凭账号认领：`user_id` 为空的行没有任何途径确认「这是我建的」。

@@ -1,4 +1,4 @@
-//! 注册、登录、注销与当前用户。
+//! 注册、登录、注销、改密与当前用户。
 
 use actix_web::{get, post, web, HttpResponse};
 use chrono::NaiveDateTime;
@@ -23,12 +23,24 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
 /// 对外的用户视图。这里没有 `password_hash` —— 字段列表本身就是白名单。
 #[derive(Debug, Serialize)]
 pub struct UserDto {
     pub id: u64,
     pub email: String,
     pub display_name: String,
+    /// `admin` / `user`
+    pub role: &'static str,
+    /// `active` / `disabled`
+    pub status: &'static str,
+    /// 为真时前端只该展示改密表单
+    pub must_change_password: bool,
     pub created_at: String,
 }
 
@@ -38,6 +50,9 @@ impl From<&User> for UserDto {
             id: user.id,
             email: user.email.clone(),
             display_name: user.display_name.clone(),
+            role: user.role.as_str(),
+            status: user.status.as_str(),
+            must_change_password: user.must_change_password,
             created_at: render_local(user.created_at),
         }
     }
@@ -75,6 +90,41 @@ pub async fn login(
 ) -> Result<HttpResponse, AppError> {
     let request = payload.into_inner();
     let issued = state.auth.login(&request.email, &request.password).await?;
+
+    Ok(session_response(
+        &state,
+        HttpResponse::Ok(),
+        &issued.token,
+        &issued.user,
+    ))
+}
+
+/// `POST /auth/password`：自助改密。
+///
+/// 成功后旧会话全部作废，响应里带一枚新 cookie，当前这台设备不用重新登录。
+/// 初始化生成的管理员改完密码后，磁盘上那份临时口令立刻删除。
+#[post("/auth/password")]
+pub async fn change_password(
+    state: web::Data<AppState>,
+    viewer: MaybeAuthUser,
+    payload: web::Json<ChangePasswordRequest>,
+) -> Result<HttpResponse, AppError> {
+    let Some(user) = viewer.0 else {
+        return Err(AppError::Unauthorized);
+    };
+
+    let request = payload.into_inner();
+    let was_temporary = user.must_change_password;
+
+    let issued = state
+        .auth
+        .change_password(user.id, &request.current_password, &request.new_password)
+        .await?;
+
+    // 只有「初始化管理员」的临时口令在文件里，改完就清掉
+    if was_temporary && user.is_admin() {
+        state.discard_admin_password_file();
+    }
 
     Ok(session_response(
         &state,

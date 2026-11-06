@@ -2,14 +2,16 @@
 //!
 //! 所有 key 的拼接规则集中在本文件，业务代码不再出现 `"short:code:..."` 之类的字面量。
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, Client};
 
-use super::{CacheError, LinkCache, PendingVisit, VisitCounter};
+use super::{CacheError, GateTicket, LinkCache, PendingVisit, VisitCounter};
 use crate::domain::short_link::CachedLink;
+use crate::security::token;
 use crate::settings::redact_credentials;
 use crate::types::BoxFuture;
 
@@ -22,6 +24,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LINK_KEY_PREFIX: &str = "short:v4:code:";
 // 计数 key 存的是纯整数，结构从未变过；跟着升版本会丢掉尚未回刷的增量，因此停在 v3
 const VISIT_KEY_PREFIX: &str = "short:v3:visits:";
+/// 票据 key。自带 TTL，过期即消失，不需要清理任务
+const GATE_KEY_PREFIX: &str = "short:gate:";
 /// 单次 SCAN 的批量大小
 const SCAN_BATCH_SIZE: usize = 200;
 
@@ -31,6 +35,10 @@ fn link_key(code: &str) -> String {
 
 fn visit_key(code: &str) -> String {
     format!("{VISIT_KEY_PREFIX}{code}")
+}
+
+fn gate_key(ticket: &str) -> String {
+    format!("{GATE_KEY_PREFIX}{ticket}")
 }
 
 /// 建立 Redis 连接。
@@ -117,6 +125,32 @@ impl VisitCounter for RedisVisitCounter {
         })
     }
 
+    fn pending_of_many<'a>(
+        &'a self,
+        codes: &'a [String],
+    ) -> BoxFuture<'a, Result<HashMap<String, u32>, CacheError>> {
+        Box::pin(async move {
+            // MGET 空 key 列表会被 Redis 当成参数错误，先挡掉
+            if codes.is_empty() {
+                return Ok(HashMap::new());
+            }
+
+            let keys: Vec<String> = codes.iter().map(|code| visit_key(code)).collect();
+            let mut conn = self.conn.clone();
+            let values: Vec<Option<i64>> = conn.mget(keys).await?;
+
+            // MGET 保证返回顺序与 key 顺序一致，可以按位置配对
+            let mut found = HashMap::with_capacity(codes.len());
+            for (code, value) in codes.iter().zip(values) {
+                let count = value.unwrap_or(0).max(0) as u32;
+                if count > 0 {
+                    found.insert(code.clone(), count);
+                }
+            }
+            Ok(found)
+        })
+    }
+
     fn increment<'a>(
         &'a self,
         code: &'a str,
@@ -185,6 +219,43 @@ impl VisitCounter for RedisVisitCounter {
             }
 
             Ok(())
+        })
+    }
+}
+
+/// 中转页「继续访问」的票据，存在 Redis 里而不是签名放进 URL：
+/// 多实例部署时，签发和兑换很可能落在不同进程上，共享存储才不会「点了没反应」。
+pub struct RedisGateTicket {
+    conn: MultiplexedConnection,
+}
+
+impl RedisGateTicket {
+    pub fn new(conn: MultiplexedConnection) -> Self {
+        Self { conn }
+    }
+}
+
+impl GateTicket for RedisGateTicket {
+    fn issue<'a>(
+        &'a self,
+        code: &'a str,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<String, CacheError>> {
+        Box::pin(async move {
+            let token = token::mint();
+            let mut conn = self.conn.clone();
+            // SETEX：一次往返写值和有效期，不会留下没有 TTL 的 key
+            let _: () = conn.set_ex(gate_key(&token), code, ttl.as_secs()).await?;
+            Ok(token)
+        })
+    }
+
+    fn redeem<'a>(&'a self, ticket: &'a str) -> BoxFuture<'a, Result<Option<String>, CacheError>> {
+        Box::pin(async move {
+            // GETDEL 是原子的：同一张票据被并发点到，只有一个请求拿得到
+            let mut conn = self.conn.clone();
+            let code: Option<String> = conn.get_del(gate_key(ticket)).await?;
+            Ok(code)
         })
     }
 }

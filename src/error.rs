@@ -21,9 +21,18 @@ pub enum AppError {
     Storage(RepoError),
     Cache(CacheError),
     CodeGenerationExhausted,
-    /// 未配置 `ADMIN_TOKEN`。用 404 而不是 403，不暴露后台的存在。
-    AdminDisabled,
+    /// 未登录。401 而不是 403：前端据此把用户送去登录页。
     Unauthorized,
+    /// 需要管理员角色
+    AdminRequired,
+    /// 账号被禁用
+    AccountDisabled,
+    /// 临时口令未更换，除了改密什么都做不了
+    PasswordChangeRequired,
+    /// 目标用户不存在
+    UserNotFound,
+    /// 拒绝这次操作，`&'static str` 说明原因（文案由前端翻译）
+    Forbidden(&'static str),
     /// 注册时邮箱已被占用
     EmailTaken,
     /// 登录失败。不区分「没这个邮箱」和「密码不对」，否则等于给人做账号探测。
@@ -55,8 +64,14 @@ impl fmt::Display for AppError {
             AppError::CodeGenerationExhausted => {
                 write!(f, "failed to allocate a unique short code, please retry")
             }
-            AppError::AdminDisabled => write!(f, "admin api is disabled"),
             AppError::Unauthorized => write!(f, "unauthorized"),
+            AppError::AdminRequired => write!(f, "administrator privileges required"),
+            AppError::AccountDisabled => write!(f, "account is disabled"),
+            AppError::PasswordChangeRequired => {
+                write!(f, "password must be changed before continuing")
+            }
+            AppError::UserNotFound => write!(f, "user not found"),
+            AppError::Forbidden(reason) => write!(f, "{reason}"),
             AppError::EmailTaken => write!(f, "email is already registered"),
             AppError::InvalidCredentials => write!(f, "email or password is incorrect"),
             AppError::Account(err) => write!(f, "{err}"),
@@ -120,8 +135,10 @@ impl ResponseError for AppError {
             | AppError::Cache(_)
             | AppError::CodeGenerationExhausted
             | AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            AppError::AdminDisabled => StatusCode::NOT_FOUND,
             AppError::Unauthorized | AppError::InvalidCredentials => StatusCode::UNAUTHORIZED,
+            AppError::AdminRequired | AppError::Forbidden(_) => StatusCode::FORBIDDEN,
+            AppError::AccountDisabled | AppError::PasswordChangeRequired => StatusCode::FORBIDDEN,
+            AppError::UserNotFound => StatusCode::NOT_FOUND,
             AppError::EmailTaken => StatusCode::CONFLICT,
             AppError::Account(_) | AppError::InvalidBody => StatusCode::BAD_REQUEST,
         }
@@ -221,7 +238,14 @@ mod tests {
                 AppError::CodeGenerationExhausted,
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
-            (AppError::AdminDisabled, StatusCode::NOT_FOUND),
+            (AppError::AdminRequired, StatusCode::FORBIDDEN),
+            (AppError::AccountDisabled, StatusCode::FORBIDDEN),
+            (AppError::PasswordChangeRequired, StatusCode::FORBIDDEN),
+            (
+                AppError::Forbidden("cannot disable your own account"),
+                StatusCode::FORBIDDEN,
+            ),
+            (AppError::UserNotFound, StatusCode::NOT_FOUND),
             (AppError::Unauthorized, StatusCode::UNAUTHORIZED),
             (AppError::EmailTaken, StatusCode::CONFLICT),
             (AppError::InvalidCredentials, StatusCode::UNAUTHORIZED),
@@ -256,6 +280,29 @@ mod tests {
         assert_eq!(
             AppError::AccessDenied(AccessDenial::Expired).public_message(),
             "short link has expired"
+        );
+    }
+
+    #[test]
+    fn permission_errors_carry_actionable_wording() {
+        // 前端按这些字符串分流：401 回登录页、这个回改密面板、那个显示「仅管理员」。
+        // 改文案等于改协议，所以在这里钉住。
+        assert_eq!(
+            AppError::PasswordChangeRequired.public_message(),
+            "password must be changed before continuing"
+        );
+        assert_eq!(
+            AppError::AccountDisabled.public_message(),
+            "account is disabled"
+        );
+        assert_eq!(
+            AppError::AdminRequired.public_message(),
+            "administrator privileges required"
+        );
+        // Forbidden 的说明原样透出：它本来就是写给人看的，不需要翻译
+        assert_eq!(
+            AppError::Forbidden("cannot change the status of your own account").public_message(),
+            "cannot change the status of your own account"
         );
     }
 

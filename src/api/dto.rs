@@ -114,6 +114,19 @@ impl CreateLinkResponse {
 #[derive(Debug, Deserialize)]
 pub struct RedirectQuery {
     pub password: Option<String>,
+    /// 中转页「继续访问」带回来的票据。
+    ///
+    /// 只有在服务端签发过票据、并且这张票据还没被兑换时才算数 ——
+    /// 它证明「刚刚通过鉴权的是同一个人」，而不是一个可以随手加的参数。
+    pub confirm: Option<String>,
+}
+
+/// 密码表单。字段名与状态页里 `<input name>` 一致。
+///
+/// 用表单而不是把密码拼进 URL：URL 会进浏览器历史、进 Referer、进反代日志。
+#[derive(Debug, Deserialize)]
+pub struct RedirectForm {
+    pub password: Option<String>,
 }
 
 /// 「最近创建」列表项。

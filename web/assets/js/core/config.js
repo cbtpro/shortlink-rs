@@ -10,7 +10,6 @@ const DEFAULTS = Object.freeze({
   env: "production",
   siteName: "shortlink",
   apiBase: "",
-  adminEnabled: true,
   liveReload: false,
   assetsStamp: "",
 });
@@ -33,7 +32,8 @@ export function applySiteName() {
   const { siteName } = appConfig();
   if (!siteName) return;
 
-  document.querySelectorAll(".brand__name, .topbar__brand span").forEach((node) => {
+  // 只改名，不碰同一行的其他 span —— 顶栏那块「后台」角标不是品牌名
+  document.querySelectorAll(".brand__name, .topbar__name").forEach((node) => {
     node.textContent = siteName;
   });
 

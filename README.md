@@ -15,6 +15,9 @@ Rust 短链接服务：`actix-web` + `sqlx`(MySQL) + Redis。
 
 ## 快速开始
 
+> 从零配置到跑通（工具链、依赖、配置、验收、排错）的完整步骤见
+> **[开发手册](docs/HANDBOOK.md)**。下面是压缩版。
+
 ### 1. 前置
 
 - Rust stable（`rustup default stable`）
@@ -28,6 +31,10 @@ cargo xtask dev
 
 它会依次做四件事：拉起 MySQL / Redis（`docker compose up -d --wait`）、编译、
 启动服务、监听源码变化。启动后打开 `http://127.0.0.1:9981/`。
+
+第一次启动会建一个管理员（`ADMIN_EMAIL`，默认 `admin@shortlink.local`），
+随机口令写在 `data/admin-initial-password.txt`。拿它登录 `/admin`，页面会先要求改密码；
+改完这个文件自动删除。忘了口令就删掉 `users` 里那条 admin 记录再启动一次。
 
 日常开发的两条热更新链路：
 
@@ -74,14 +81,18 @@ profile=development addr=0.0.0.0:9981 public=http://127.0.0.1:9981 db=mysql://**
 | `POST` | `/auth/logout` | 注销 | `204` |
 | `GET` | `/auth/me` | 当前登录用户，未登录返回 `{"user":null}` | `200` |
 | `POST` | `/shorten` | 创建短链（登录时归属到账号） | `201` |
-| `GET` | `/{code}` | 跳转（开启中转页时先返回确认页 `200`），可选 `?password=` | `302` |
+| `GET` | `/{code}` | 跳转（开启中转页时先返回确认页 `200`，点「继续访问」才计数），可选 `?password=` | `302` |
 | `GET` | `/recent` | 最近的创建（登录看账号下全部，未登录看本浏览器） | `200` |
 | `DELETE` | `/recent/{code}` | 删除一条（登录即短链失效，未登录只移出清单） | `204` |
 | `DELETE` | `/recent` | 清空（仅未登录身份可用） | `204` |
-| `GET` | `/admin` | 管理后台（需 `ADMIN_TOKEN`） | `200` |
-| `GET` | `/admin/api/overview` | 概览统计 | `200` |
-| `GET` | `/admin/api/links` | 分页列表，支持搜索与状态筛选 | `200` |
-| `DELETE` | `/admin/api/links/{code}` | 删除短链并清缓存 | `204` |
+| `GET` | `/admin` | 后台（登录后进入，普通用户看自己的短链） | `200` |
+| `POST` | `/auth/password` | 自助改密，成功后旧会话全部作废 | `200` |
+| `GET` | `/console/api/overview` | 概览统计（按角色收窄） | `200` |
+| `GET` | `/console/api/links` | 分页列表，支持搜索、状态与归属筛选 | `200` |
+| `DELETE` | `/console/api/links/{code}` | 删除短链并清缓存（普通用户仅限自己的） | `204` |
+| `GET` | `/admin/api/users` | 用户列表（仅管理员） | `200` |
+| `POST` | `/admin/api/users/{id}/password` | 重置为一次性口令（仅管理员，响应禁止缓存） | `200` |
+| `POST` | `/admin/api/users/{id}/status` | 启用 / 停用（仅管理员） | `200` |
 | `GET` | `/app-config.js` | 前端运行时配置（站点名、接口前缀、环境） | `200` |
 | `GET` | `/healthz` | 存活检查，不碰依赖 | `200` |
 | `GET` | `/readyz` | 就绪检查，探测 MySQL 与 Redis | `200` / `503` |
@@ -90,7 +101,12 @@ profile=development addr=0.0.0.0:9981 public=http://127.0.0.1:9981 db=mysql://**
 会话用 `sl_session` cookie（HttpOnly + SameSite=Lax，库中只存令牌的 SHA-256 指纹）。
 `/recent*` 与 `POST /shorten` 的行为按身份分流：**登录**时看 `short_links.user_id`，
 删除即短链失效；**未登录**时退回 `sl_visitor` 匿名 cookie + `link_creations` 表，
-删除只是移出自己的清单。后台接口用 `Authorization: Bearer <ADMIN_TOKEN>` 鉴权。
+删除只是移出自己的清单。
+
+后台同样是 cookie 鉴权，没有单独的访问口令：角色（`users.role`）决定能看多少 ——
+普通用户只能看、只能删自己名下的短链，管理员还能看全站、按归属筛选、重置密码、启用禁用。
+`/admin/api/users*` 只有管理员能过。首次启动会建一个管理员并把随机口令写进
+`data/admin-initial-password.txt`，登录后必须先改密，改完该文件自动删除。
 `/assets/**` 下的样式与 ES 模块、`/favicon.ico` 是页面资源，
 注册在 `/{code}` 兜底路由之前。字段、示例与完整状态码见 [docs/API.md](docs/API.md)。
 
@@ -106,7 +122,7 @@ config/
 ├── development.env   开发档：前端直读磁盘 + 热刷新 + debug 日志
 ├── test.env          测试档
 └── production.env    生产档骨架（敏感项留空，由环境变量注入）
-xtask/src/            构建工具：dev / build / release / check / fmt / db
+xtask/src/            构建工具：dev / build / release / check / web-test / fmt / db
 src/
 ├── main.rs          进程入口，只转发给 bootstrap
 ├── bootstrap.rs     组合根：装配依赖、启动服务、日志与端口错误处理
@@ -120,16 +136,17 @@ src/
 ├── domain/          领域层：实体、校验规则、访问策略（不依赖 web/redis）
 │   ├── short_link.rs    ShortLink / CachedLink / AccessPolicy / LinkState
 │   ├── new_link.rs      NewShortLink 与校验
-│   ├── account.rs       User / NewUser 与邮箱、口令、昵称规则
+│   ├── account.rs       User / Role / AccountStatus / Access 与邮箱、口令、昵称规则
 │   └── code.rs          短码生成策略与合法性
-├── security/        凭据原语：PBKDF2 口令散列、会话令牌生成与指纹
+├── security/        凭据原语：PBKDF2 口令散列、会话令牌生成与指纹、一次性口令生成
 ├── repository/      持久化端口（链接 / 用户 / 会话）+ MySQL 实现（+ 测试用内存实现）
-├── cache/           缓存端口 + Redis 实现（内容缓存 / 访问计数 / 失效清理）
-├── service/         用例编排：shorten / redirect / admin / history / auth / my_links
+├── cache/           缓存端口 + Redis 实现（内容缓存 / 访问计数 / 中转票据 / 失效清理）
+├── service/         用例编排：shorten / redirect / console / history / auth / my_links
 ├── api/             HTTP 适配：DTO + handler，只做协议转换
 │   ├── assets.rs       页面与 /assets/** 分发（路径校验与 ETag 在 assets 层）
-│   ├── auth.rs         /auth/*，注册、登录、注销与当前用户
-│   ├── session.rs      sl_session cookie 读写与 MaybeAuthUser 提取器
+│   ├── auth.rs         /auth/*，注册、登录、注销、改密与当前用户
+│   ├── console.rs      /console/api/*、/admin/api/users*，后台列表与账号管理
+│   ├── session.rs      sl_session cookie 读写与 AuthUser / MaybeAuthUser 提取器
 │   ├── app_config.rs   /app-config.js，下发给前端的运行时配置
 │   ├── dev.rs          /__dev/*，浏览器自动刷新用，未开启时 404
 │   └── health.rs       /healthz、/readyz
@@ -139,16 +156,25 @@ src/
 web/                 前端源码。开发时逐请求读磁盘，发布时编进二进制
 ├── index.html       首页（创建短链）
 ├── login.html       登录 / 注册页
-├── admin.html       管理后台（概览 / 列表 / 删除）
+├── admin.html       后台（概览 / 短链 / 用户，按角色显示）
 ├── interstitial.html 中转页模板，占位符由 api::interstitial 转义后填充
+├── notice.html      状态页模板（过期 / 上限 / 密码 / 不存在），由 api::notice 填充
 └── assets/
-    ├── css/         base（配色与通用控件）/ home / admin / interstitial / auth
+    ├── css/         base（配色与通用控件）/ home / admin / interstitial / notice / auth
     └── js/
-        ├── core/        跨页面基础件：DOM、请求层、运行时配置、会话、格式化、吐司、剪贴板
+        ├── core/        跨页面基础件：DOM、请求层、运行时配置、会话、错误文案、格式化、吐司、剪贴板
         ├── dev/         仅开发期加载：live-reload.js
-        ├── features/    业务封装：后台 API 客户端、最近创建客户端
+        ├── features/    业务封装：控制台客户端、两段确认按钮、最近创建客户端
         └── pages/       页面入口，原生 ES Modules（无构建步骤）
+            └── admin/   后台拆成编排 + 短链 / 用户 / 改密三块
+
+web-test/            前端单元测试（node --test + jsdom）
+├── package.json     唯一开发依赖是 jsdom，版本锁在 package-lock.json
+└── tests/           直接 import web/assets/js/** 的原文件，不打包、不转译
 ```
+
+`web-test/` 刻意放在 `web/` 之外：`build.rs` 会把 `web/` 下的**所有**文件编进二进制，
+测试与被 `npm install` 拖进来的 `node_modules` 绝不该进产物。
 
 约定：
 
@@ -158,6 +184,8 @@ web/                 前端源码。开发时逐请求读磁盘，发布时编�
 - 接口字段调整只改 `api/dto.rs`，不波及领域模型；
 - 新增路由在 `api::configure` 挂载，注意 `/{code}` 必须最后注册；
 - 新增前端文件不用改任何 Rust 代码：`build.rs` 会扫描进清单，`cargo xtask dev` 下直接生效；
+- 改前端逻辑后跑 `cargo xtask web-test`（首次先 `cd web-test && npm install`）；
+  测试文件放 `web-test/tests/`，不要放进 `web/`，否则会被编进二进制；
 - 新增配置项：在 `config/base.env` 给默认值，在 `settings::Config` 加字段与校验，然后 `summary()` 里补一行。
 
 ## 配置
@@ -188,12 +216,13 @@ web/                 前端源码。开发时逐请求读磁盘，发布时编�
 | `PUBLIC_BASE_URL` | 否 | `http://127.0.0.1:$SERVER_PORT` | 返回给用户的短链前缀；其路径部分会成为前端 `apiBase` |
 | `DATABASE_MAX_CONNECTIONS` | 否 | `10` | 连接池上限 |
 | `CACHE_LINK_TTL_SECONDS` | 否 | `3600` | 短链缓存存活时间 |
-| `VISIT_FLUSH_INTERVAL_SECONDS` | 否 | `300` | 访问计数回刷间隔 |
+| `VISIT_FLUSH_INTERVAL_SECONDS` | 否 | `60` | 访问计数回刷间隔，越短库里越接近实时 |
 | `SHORT_CODE_LENGTH` | 否 | `7` | 自动生成短码长度（1–10） |
 | `HISTORY_RECENT_LIMIT` | 否 | `20` | 每个账号 / 浏览器保留的「最近创建」条数 |
 | `SESSION_TTL_DAYS` | 否 | `30` | 登录会话有效期（天，≥ 1）。到期即失效，不滑动续期 |
 | `PASSWORD_HASH_ITERATIONS` | 否 | `600000`（开发档 `100000`） | PBKDF2 迭代数。散列串自带参数，调高不影响老账号登录 |
-| `ADMIN_TOKEN` | 否 | 开发档 `dev-admin-token` | 后台口令，≥ 8 字符；**不配置则后台整体关闭**（`/admin*` 一律 404） |
+| `ADMIN_EMAIL` | 否 | `admin@shortlink.local` | 初始化管理员的登录邮箱；只在库里没有管理员时用来建号 |
+| `ADMIN_PASSWORD_FILE` | 否 | `data/admin-initial-password.txt` | 一次性口令落盘位置（写文件权限 0600），改密后自动删除 |
 | `ASSETS_MODE` | 否 | `auto` | `auto` / `disk` / `embedded`；auto 在开发档取 disk、其余取 embedded |
 | `ASSETS_ROOT` | 否 | `web` | disk 模式下的资源根目录 |
 | `LIVE_RELOAD` | 否 | 开发档开 | 注入浏览器自动刷新脚本；资源内嵌时强制关闭 |
@@ -283,6 +312,27 @@ ALTER TABLE short_links
 | Cookie | `sl_session`，`HttpOnly` + `SameSite=Lax` + `path=/` + 绝对过期；`PUBLIC_BASE_URL` 为 https 时加 `Secure` |
 | 阻塞隔离 | 散列与校验走 `spawn_blocking`，不占 actix worker 线程 |
 | 清理 | 后台任务每 6 小时删一次过期会话；`user_sessions` 外键随用户级联删除 |
+| 改密 | 成功后 `delete_for_user` 踢掉全部会话，只给当前设备重签一枚 |
+| 禁用 | 会话查询里带 `u.status = 'active'`，禁用那一刻所有会话同时失效 |
+
+## 角色与后台
+
+后台没有单独的访问口令，凭的就是登录会话 —— 一个口令两套凭据只会让人分不清谁在操作。
+
+| 角色 | 能做什么 |
+| --- | --- |
+| `user`（注册即此） | 看/删自己名下的短链，看自己的概览，改自己的密码 |
+| `admin` | 以上全部 + 看全站短链、按归属筛选、管理用户（重置密码、启用/禁用） |
+
+- 角色与状态存在 `users` 表里，不靠配置：改一次立刻生效，不重启服务。
+- 未知值有明确的降级方向：`role` 认不出按 `user`（少给权限），`status` 认不出按 `disabled`（宁可拒绝）。
+- **首次启动**若库里没有管理员，用 `ADMIN_EMAIL` 建一个，随机口令写进 `ADMIN_PASSWORD_FILE`
+  （Unix 下 `0600`），并要求首次登录必须改密；改完该文件立即删除。
+- 临时口令未换掉时，`AuthUser` 提取器把所有业务接口挡成 403，只放行 `POST /auth/password`。
+- 越权防线在用例层（`service::console::scope_of`）：普通用户的归属参数被无条件覆盖，
+  删除走「归属匹配」的 SQL，别人的短链与不存在的短链一样返回 404。
+- 管理员不能停用或重置自己，也不能动另一个管理员 —— 没有「提升为管理员」的入口，
+  把自己锁在门外就只能改库了。
 
 会话有效期是**绝对过期**，不做滑动续期：长期开着的标签页该到期就到期，重新登录一次即可。
 
@@ -328,7 +378,9 @@ cargo test domain:: # 只跑领域层
 ```bash
 cargo xtask dev            # 构建 + 启动 + 监听（默认先拉起 MySQL / Redis）
 cargo xtask dev --port 9982 --no-infra
-cargo xtask check          # fmt --check + clippy -D warnings + test
+cargo xtask check          # fmt --check + clippy -D warnings + test + web-test
+cd web-test && npm install # 首次：装前端测试依赖（jsdom）
+cargo xtask web-test       # 前端用例（node --test + jsdom），不装依赖会跳过
 cargo xtask fmt            # 格式化
 cargo xtask build          # 只编译
 cargo xtask db up|down|ps|logs
@@ -345,6 +397,7 @@ Rust 是静态编译语言，后端没有真正意义上的热更新，`cargo xt
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/HANDBOOK.md](docs/HANDBOOK.md) | **开发手册**：环境准备、首次启动、配置、数据库、日常开发、调试、排错、提交 |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 开发环境：目录约定、配置分层、热更新原理、xtask 命令、排错 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、调用链、关键决策与权衡、扩展指引 |
 | [docs/API.md](docs/API.md) | 接口字段、响应示例、错误文案、状态码总表 |
@@ -354,12 +407,14 @@ Rust 是静态编译语言，后端没有真正意义上的热更新，`cargo xt
 
 - **访问密码是明文比对**，未做哈希（区别于账号口令）；要统一需迁移存量链接。
 - **`ip_limit` / `ua_limit` 只落库，不参与判定**。当前唯一影响是带这两个字段的链接不进缓存。
-- 创建短链的公开接口不要求登录：任何人都能建链，只是登录后才归属到账号。后台接口由
-  `ADMIN_TOKEN` 保护，但令牌经请求头明文传输，仅在 HTTPS 或内网环境使用。
-- 没有邮箱验证、找回密码与改密码入口：注册时填什么就是什么，忘记口令只能由管理员在库里处理。
+- 创建短链的公开接口不要求登录：任何人都能建链，只是登录后才归属到账号。
+- 没有「提升为管理员」的界面入口：新增一个管理员要改库（`UPDATE users SET role='admin'`），
+  这是刻意的 —— 能改库的人本来就已经是最高权限。
+- 没有邮箱验证与自助找回密码：忘记口令只能由管理员重置成一次性口令，或直接改库。
 - 没有按账号的配额与频率限制，注册接口可被批量调用。
 - 匿名链接（未登录时创建）任何人都不能凭账号认领，包括后来的自己。
-- 后台概览里的「总访问」只含已回刷到库的计数，最近几分钟的增量不计入。
+- 后台概览里的「总访问」是库里的汇总，最多落后一个回刷周期（默认 60 秒）；
+  列表里的单条 `visit_count` 已经把未回刷的增量算进去了。
 - 没有编辑、批量操作与访问日志；未登录时界面的「最近创建」按匿名 cookie 记在服务端，
   换设备或清除 cookie 后不可见。
 - 建表脚本文件名 `talbe.sql` 是 `table.sql` 的笔误，暂未重命名；表结构变更靠 `migrations/` 下手工维护的增量 SQL，没有自动迁移机制。

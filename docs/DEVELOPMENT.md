@@ -3,6 +3,9 @@
 这份文档解释「怎么改代码最快看到结果」，以及这套开发环境为什么这么搭。
 架构层面的分层与依赖方向见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
+> 第一次配环境、只想按步骤把服务跑起来，看 [开发手册](HANDBOOK.md)；
+> 这份文档讲的是原理与取舍。
+
 ## 一条命令
 
 ```bash
@@ -79,7 +82,7 @@ config/{APP_ENV}.env     环境档：端口、日志、资源模式
 启动日志第一行是全部关键配置的摘要（连接串已隐去凭据）：
 
 ```
-profile=development addr=0.0.0.0:9981 public=http://127.0.0.1:9981 db=mysql://***@127.0.0.1:3306/short_link assets=disk live_reload=on admin=enabled session_ttl=30d password_iterations=100000
+profile=development addr=0.0.0.0:9981 public=http://127.0.0.1:9981 db=mysql://***@127.0.0.1:3306/short_link assets=disk live_reload=on admin=admin@shortlink.local password_file=data/admin-initial-password.txt session_ttl=30d password_iterations=100000
 ```
 
 ### 为什么开发档的迭代数是 10 万
@@ -106,7 +109,6 @@ window.__APP_CONFIG__ = {
   env: "development",
   siteName: "shortlink",
   apiBase: "",            // 反代到子路径时是 "/sub"
-  adminEnabled: true,
   liveReload: true,
   assetsStamp: "d8c553eddf829bab",
 };
@@ -125,13 +127,18 @@ cargo xtask dev [--port N] [--no-infra] [--once] [--release]
 cargo xtask build
 cargo xtask release
 cargo xtask check
+cargo xtask web-test
 cargo xtask fmt [--check]
 cargo xtask db <up|down|restart|ps|logs|reset>
 ```
 
 - `release`：`cargo build --release --locked` 后把可执行文件、`config/`、`.env.example`
   组装到 `dist/`，整个目录拷到服务器就能跑；
-- `check`：格式 → clippy（`-D warnings`）→ 测试，提交前跑一遍；
+- `check`：格式 → clippy（`-D warnings`）→ Rust 测试 → 前端测试，提交前跑一遍；
+  前端那段在 `web-test/node_modules` 不存在时只跳过（并打出安装命令），
+  这样没装 node 的机器仍能过闸门；要确认它真的跑过，单独执行 `cargo xtask web-test`；
+- `web-test`：在 `web-test/` 里跑 `node --test`，用例直接 import `web/assets/js/**`，
+  不打包、不转译；依赖只有一个 jsdom（`cd web-test && npm install`）；
 - `db reset`：删数据卷重建，必须加 `--yes`。
 
 `cargo xtask` 是 `.cargo/config.toml` 里的 alias，等价于 `cargo run -p xtask --`。
@@ -145,7 +152,8 @@ cargo xtask db <up|down|restart|ps|logs|reset>
 | 改了 Rust 没反应 | 看 `cargo xtask dev` 的输出：多半是编译失败了，旧进程还在服务 |
 | 启动即报缺 `DATABASE_URL` | 配置层没读到：检查 `APP_ENV`、`config/` 是否在预期位置，必要时 `SHORTLINK_CONFIG_DIR` 指过去 |
 | `/readyz` 返回 503 | 响应体里的 `failed` 会写明是 `mysql` 还是 `redis`；`cargo xtask db ps` 看容器 |
-| 后台 404 | `ADMIN_TOKEN` 没配或短于 8 位；这是设计行为，不暴露后台是否存在 |
+| 后台一直跳登录页 | 没有 `sl_session` cookie：没登录、账号被停用，或在别处改过密码；看 `/auth/me` 的返回 |
+| 登录后只能看到改密面板 | 用的是临时口令（`must_change_password` 为真），改完才能用其他接口 |
 | 登录接口慢到一秒以上 | 先看启动摘要里的 `password_iterations`；再确认 `Cargo.toml` 的 `[profile.dev]` 与 `[profile.dev.package."*"]` 两条还在 |
 | 登录后刷新就掉线 | cookie 被清或 `Secure` 属性和当前协议不匹配：http 访问却把 `PUBLIC_BASE_URL` 配成了 `https://` |
 | `/auth/me` 一直返回 `null` | 浏览器没带 cookie（跨站请求、`SameSite` 拦截），或会话已被后台清理 |

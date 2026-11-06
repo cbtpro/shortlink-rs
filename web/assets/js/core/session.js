@@ -52,6 +52,20 @@ export async function logout() {
   loaded = true;
 }
 
+/**
+ * 改密。
+ *
+ * 服务端会把该账号所有会话作废，同时给这次请求重新签一枚 cookie ——
+ * 所以改完密码当前这台设备还在线，别处登录过的都下线了。
+ */
+export async function changePassword(currentPassword, newPassword) {
+  const body = await request(
+    `${apiBase()}/auth/password`,
+    jsonRequest({ current_password: currentPassword, new_password: newPassword })
+  );
+  return remember(body);
+}
+
 function remember(body) {
   current = body?.user ?? null;
   loaded = true;

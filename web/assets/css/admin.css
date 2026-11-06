@@ -46,7 +46,18 @@
 
 .topbar__actions {
   display: flex;
+  align-items: center;
   gap: 6px;
+}
+
+/* 当前登录的账号。长邮箱靠省略号收住，别把右侧的按钮挤走 */
+.topbar__user {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .button--ghost {
@@ -63,7 +74,7 @@
   background: var(--surface-soft);
 }
 
-/* 口令闸门 */
+/* 登录提示与改密面板 */
 
 .gate {
   max-width: 380px;
@@ -84,21 +95,6 @@
   margin: 0 0 18px;
   font-size: 12px;
   color: var(--muted);
-}
-
-.gate__lead code {
-  font-family: var(--font-mono);
-  font-size: 0.95em;
-  background: var(--surface-soft);
-  border-radius: var(--radius-sm);
-  padding: 0 3px;
-}
-
-.gate__label {
-  display: block;
-  margin-bottom: 5px;
-  font-size: 12px;
-  font-weight: 600;
 }
 
 .gate .button--primary {
@@ -210,6 +206,40 @@
   box-shadow: 0 0 0 1px var(--border);
 }
 
+/* 生效中的归属筛选：一眼看出列表被收窄了，旁边就是取消 */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 3px 4px 3px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.chip__text strong {
+  font-weight: 600;
+}
+
+.chip__close {
+  border: none;
+  background: none;
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.chip__close:hover {
+  color: var(--danger);
+  background: var(--surface-soft);
+}
+
 .board__error {
   margin: 10px 15px 0;
   padding: 7px 10px;
@@ -286,6 +316,34 @@
   color: var(--muted);
 }
 
+/* 归属列：只在管理员视角下出现 */
+.cell-owner {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+/* 账号列：邮箱 + 昵称两行，比并排放一列省宽度 */
+.cell-account__email {
+  display: block;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cell-account__name {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.cell-muted {
+  color: var(--muted);
+}
+
 .cell-time {
   white-space: nowrap;
   color: var(--muted);
@@ -326,6 +384,19 @@
   margin-left: 4px;
 }
 
+.badge--danger {
+  color: var(--danger);
+}
+
+.badge--warn {
+  color: var(--warn);
+  margin-left: 4px;
+}
+
+.badge--admin {
+  color: var(--accent);
+}
+
 .row-action {
   display: inline-block;
   border: none;
@@ -354,6 +425,14 @@
   color: var(--danger);
   background: var(--danger-soft);
   font-weight: 600;
+}
+
+/* 「本人」「管理员」这类没有动作可做的位置，占住宽度但不引诱点击 */
+.row-note {
+  display: inline-block;
+  padding: 3px 6px;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 /* 空态与分页 */
@@ -385,6 +464,71 @@
 .pager__actions {
   display: flex;
   gap: 6px;
+}
+
+/* 一次性口令浮层 */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+.overlay__card {
+  width: min(100%, 380px);
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+}
+
+.overlay__title {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.overlay__lead {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.overlay__lead strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.overlay__hint {
+  margin: 0 0 14px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.overlay__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* 选中即全选：口令里没有空格，双击选词反而容易漏字符 */
+.credential {
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-soft);
+  font-family: var(--font-mono);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  text-align: center;
+  word-break: break-all;
+  user-select: all;
 }
 
 /* 加载占位 */
@@ -425,6 +569,17 @@
     flex: 1 1 auto;
     overflow-x: auto;
   }
+
+  .chip {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .chip__text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 
 @media (max-width: 560px) {
@@ -436,6 +591,11 @@
   .gate {
     margin-top: 5vh;
     padding: 18px;
+  }
+
+  /* 窄屏优先保证按钮排得下，账号名可以不显示 */
+  .topbar__user {
+    display: none;
   }
 
   .cell-url {

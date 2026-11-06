@@ -1,0 +1,22 @@
+/* 状态页（过期 / 上限 / 密码 / 不存在）独有的块。
+   版式与配色沿用 base.css 与 interstitial.css，这里只加密码表单。 */
+
+.gate__form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 24px;
+  max-width: 320px;
+}
+
+.gate__label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* 表单里的输入框宽度跟着表单走，不被 base.css 的 100% 撑满整页 */
+.gate__form input {
+  width: 100%;
+  font-family: var(--font-mono);
+}

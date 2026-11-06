@@ -1,4 +1,4 @@
-//! 注册、登录、注销与请求鉴权。
+//! 注册、登录、注销、改密与请求鉴权。
 //!
 //! 会话用的是「不透明令牌 + 服务端记录」，不是 JWT：
 //! 注销要能立刻生效，JWT 做不到（除非再引入一份黑名单，等于把会话表换个形式存回来）。
@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 
-use crate::domain::account::{NewUser, User};
+use crate::domain::account::{validate_password, Access, AccountError, NewUser, User};
 use crate::error::AppError;
 use crate::repository::{SessionRepository, UserRepository};
 use crate::security::token;
 use crate::security::PasswordHasher;
+use crate::service::run_blocking;
 
 /// 登录成功后的凭据：令牌写进 cookie，用户信息回给前端。
 pub struct IssuedSession {
@@ -70,7 +71,11 @@ impl AuthService {
         new.validate()?;
 
         let password_hash = self.hash(&new.password).await?;
-        let user = self.users.create(&new, &password_hash).await?;
+        // 自助注册永远是普通用户：角色只能由系统给，不能由请求体决定
+        let user = self
+            .users
+            .create(&new, &password_hash, Access::USER)
+            .await?;
         let token = self.issue(&user).await?;
 
         Ok(IssuedSession { token, user })
@@ -88,6 +93,8 @@ impl AuthService {
         let matches = self.verify(password.to_owned(), hash).await?;
 
         match (user, matches) {
+            // 先验密码再看状态：否则只要输入任意口令就能问出「这个邮箱被停用了」
+            (Some(user), true) if !user.is_active() => Err(AppError::AccountDisabled),
             (Some(user), true) => {
                 let token = self.issue(&user).await?;
                 Ok(IssuedSession { token, user })
@@ -95,6 +102,58 @@ impl AuthService {
             // 两种情况给同一个错误：不告诉对方是邮箱还是密码错了
             _ => Err(AppError::InvalidCredentials),
         }
+    }
+
+    /// 自助改密。成功后旧会话全部作废，只留下这一次签发的令牌。
+    pub async fn change_password(
+        &self,
+        user_id: u64,
+        current: &str,
+        new: &str,
+    ) -> Result<IssuedSession, AppError> {
+        let user = self
+            .users
+            .find_by_id(user_id)
+            .await?
+            .ok_or(AppError::Unauthorized)?;
+
+        if !self
+            .verify(current.to_owned(), user.password_hash.clone())
+            .await?
+        {
+            return Err(AppError::InvalidCredentials);
+        }
+
+        validate_password(new)?;
+        if new == current {
+            return Err(AppError::Account(AccountError::PasswordUnchanged));
+        }
+
+        self.replace_password(&user, new).await?;
+        // 换完密码，别人手里的令牌一律失效 —— 改密的意义就在这里
+        self.sessions.delete_for_user(user.id).await?;
+
+        let fresh = self
+            .users
+            .find_by_id(user.id)
+            .await?
+            .ok_or(AppError::UserNotFound)?;
+        let token = self.issue(&fresh).await?;
+
+        Ok(IssuedSession { token, user: fresh })
+    }
+
+    /// 覆盖口令。只有自助改密走这里；管理员重置在 `service::console` ——
+    /// 那条路径要多做「不能重置管理员」的判定，混在一起反而两边都不清楚。
+    async fn replace_password(&self, user: &User, password: &str) -> Result<(), AppError> {
+        validate_password(password)?;
+        let hash = self.hash(password).await?;
+
+        if !self.users.set_password(user.id, &hash, false).await? {
+            return Err(AppError::UserNotFound);
+        }
+
+        Ok(())
     }
 
     /// 用 cookie 里的令牌换用户。令牌无效 / 过期 / 格式不对都返回 `None`。
@@ -159,30 +218,18 @@ impl AuthService {
     }
 }
 
-/// 在阻塞线程池里跑一段 CPU 密集的活，并把 panic 转成 500。
-async fn run_blocking<T, F>(job: F) -> Result<T, AppError>
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    match tokio::task::spawn_blocking(job).await {
-        Ok(value) => Ok(value),
-        // 散列实现 panic 属于程序缺陷，用户侧只该看到 500；细节留给日志
-        Err(err) => Err(AppError::Internal(format!(
-            "password hashing failed: {err}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::account::AccountStatus;
+    use crate::repository::UserRepository;
     use crate::test_support::{InMemoryLinkRepository, PlainHasher};
 
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
     struct Harness {
         service: AuthService,
+        store: Arc<InMemoryLinkRepository>,
     }
 
     fn harness() -> Harness {
@@ -192,7 +239,7 @@ mod tests {
     fn harness_with_ttl(ttl: Duration) -> Harness {
         let store = Arc::new(InMemoryLinkRepository::new());
         let service = AuthService::new(store.clone(), store.clone(), Arc::new(PlainHasher), ttl);
-        Harness { service }
+        Harness { service, store }
     }
 
     fn signup(email: &str, password: &str) -> NewUser {
@@ -401,5 +448,128 @@ mod tests {
     #[tokio::test]
     async fn exposes_the_configured_ttl() {
         assert_eq!(harness_with_ttl(DAY).service.session_ttl(), DAY);
+    }
+
+    #[tokio::test]
+    async fn change_password_swaps_the_credential_and_drops_old_sessions() {
+        let h = harness();
+        let first = h
+            .service
+            .register(signup("g@example.com", "secret123"))
+            .await
+            .unwrap();
+        // 另一台设备上的会话
+        let second = h.service.login("g@example.com", "secret123").await.unwrap();
+
+        let renewed = h
+            .service
+            .change_password(first.user.id, "secret123", "brandnew123")
+            .await
+            .expect("改密应成功");
+
+        assert!(
+            h.service
+                .authenticate(&renewed.token)
+                .await
+                .unwrap()
+                .is_some(),
+            "当前设备拿到的新会话应可用"
+        );
+        for stale in [&first.token, &second.token] {
+            assert!(
+                h.service.authenticate(stale).await.unwrap().is_none(),
+                "改密后旧会话必须失效"
+            );
+        }
+
+        assert!(h
+            .service
+            .login("g@example.com", "brandnew123")
+            .await
+            .is_ok());
+        assert!(matches!(
+            h.service.login("g@example.com", "secret123").await,
+            Err(AppError::InvalidCredentials)
+        ));
+        assert!(!renewed.user.must_change_password);
+    }
+
+    #[tokio::test]
+    async fn change_password_rejects_bad_input() {
+        let h = harness();
+        let session = h
+            .service
+            .register(signup("h@example.com", "secret123"))
+            .await
+            .unwrap();
+        let id = session.user.id;
+
+        assert!(matches!(
+            h.service
+                .change_password(id, "wrong-password", "brandnew123")
+                .await,
+            Err(AppError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            h.service.change_password(id, "secret123", "short").await,
+            Err(AppError::Account(AccountError::PasswordTooShort))
+        ));
+        assert!(matches!(
+            h.service
+                .change_password(id, "secret123", "secret123")
+                .await,
+            Err(AppError::Account(AccountError::PasswordUnchanged))
+        ));
+
+        // 失败的尝试不该动到原口令
+        assert!(h.service.login("h@example.com", "secret123").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn disabled_accounts_cannot_log_in() {
+        let h = harness();
+        let session = h
+            .service
+            .register(signup("i@example.com", "secret123"))
+            .await
+            .unwrap();
+
+        h.store
+            .set_status(session.user.id, AccountStatus::Disabled)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            h.service.login("i@example.com", "secret123").await,
+            Err(AppError::AccountDisabled)
+        ));
+        assert!(
+            h.service
+                .authenticate(&session.token)
+                .await
+                .unwrap()
+                .is_none(),
+            "禁用后旧会话也不该再解析出用户"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_password_never_reveals_a_disabled_account() {
+        // 口令错时仍是「邮箱或密码不正确」，不能靠状态码问出账号被停用
+        let h = harness();
+        let session = h
+            .service
+            .register(signup("j@example.com", "secret123"))
+            .await
+            .unwrap();
+        h.store
+            .set_status(session.user.id, AccountStatus::Disabled)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            h.service.login("j@example.com", "wrong-one").await,
+            Err(AppError::InvalidCredentials)
+        ));
     }
 }

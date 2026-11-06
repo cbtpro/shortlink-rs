@@ -82,11 +82,50 @@ impl FromRequest for MaybeAuthUser {
     }
 }
 
+/// 「必须是可用的已登录用户」。
+///
+/// 与 [`MaybeAuthUser`] 的分工：那是「登录了就是用户，没登录就是游客」的展示需求，
+/// 这是「没登录就不许做」的准入判断。另外两类账号在这里一次性挡掉：
+/// - 被禁用的账号（会话查询已经过滤，这里再兜一层）；
+/// - 临时口令尚未更换的账号 —— 除了改密接口，其余一律 403。
+pub struct AuthUser(pub User);
+
+impl FromRequest for AuthUser {
+    type Error = AppError;
+    type Future = AuthFuture<Self>;
+
+    fn from_request(request: &HttpRequest, _payload: &mut actix_web::dev::Payload) -> Self::Future {
+        let state = request.app_data::<web::Data<AppState>>().cloned();
+        let presented = read(request);
+
+        Box::pin(async move {
+            let (Some(state), Some(presented)) = (state, presented) else {
+                return Err(AppError::Unauthorized);
+            };
+
+            let user = state
+                .auth
+                .authenticate(&presented)
+                .await?
+                .ok_or(AppError::Unauthorized)?;
+
+            if !user.is_active() {
+                return Err(AppError::AccountDisabled);
+            }
+            // 临时口令只能用来改密码：否则管理员第一次登录后可以一直用文件里那串口令
+            if user.must_change_password {
+                return Err(AppError::PasswordChangeRequired);
+            }
+
+            Ok(AuthUser(user))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use actix_web::test::TestRequest;
-
     #[test]
     fn reads_well_formed_tokens_only() {
         let good = token::mint();

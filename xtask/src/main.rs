@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "build" => pipeline::build(false),
         "release" => pipeline::release(),
         "check" => pipeline::check(),
+        "web-test" => pipeline::web_test(true),
         "fmt" => pipeline::fmt(rest.iter().any(|arg| arg == "--check")),
         "db" => match rest.first() {
             Some(action) => infra::run(action, rest.iter().any(|arg| arg == "--yes")),
@@ -111,7 +112,8 @@ fn print_help() {
 
   build              调试构建
   release            release 构建并组装 dist/（可执行文件 + 配置目录）
-  check              依次执行 fmt --check、clippy -D warnings、test
+  check              依次执行 fmt --check、clippy -D warnings、test、web-test
+  web-test           前端单元测试（node --test + jsdom），依赖装在 web-test/
   fmt [--check]      格式化（--check 只检查）
 
   db <动作>          本地中间件：up | down | restart | ps | logs | reset

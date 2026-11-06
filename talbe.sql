@@ -6,6 +6,14 @@ CREATE TABLE IF NOT EXISTS `users` (
   -- 口令散列自带算法与迭代次数：pbkdf2-sha256$<iterations>$<salt>$<hash>
   -- 因此调高迭代次数不会让老账号登录失败
   `password_hash` VARCHAR(255) NOT NULL COMMENT 'PBKDF2-HMAC-SHA256 散列串',
+  -- 角色与状态存在库里而不是配置里：改一次要立刻生效，不该重启服务。
+  -- 用 VARCHAR 而非 ENUM，是为了让「未知值怎么处理」只由领域层决定：
+  -- 角色认不出按普通用户（少给权限），状态认不出按禁用（宁可拒绝）。
+  `role` VARCHAR(16) NOT NULL DEFAULT 'user' COMMENT '角色：user / admin，未知值按 user 处理',
+  `status` VARCHAR(16) NOT NULL DEFAULT 'active' COMMENT '账号状态：active / disabled，未知值按 disabled 处理',
+  `must_change_password` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '为 1 时除改密外一律 403',
+  -- 只写不读的审计字段：管理员重置过谁、对方有没有真的改掉
+  `password_changed_at` DATETIME NULL DEFAULT NULL COMMENT '最近一次改密时间（UTC）',
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '注册时间（UTC）',
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_users_email` (`email`)

@@ -66,6 +66,7 @@ impl AssetServer {
                     "admin.html",
                     "login.html",
                     "interstitial.html",
+                    "notice.html",
                 ] {
                     let path = root.join(required);
                     if !path.is_file() {
@@ -302,6 +303,7 @@ mod tests {
             "admin.html",
             "login.html",
             "interstitial.html",
+            "notice.html",
         ] {
             let asset = assets
                 .get(page)
@@ -329,6 +331,7 @@ mod tests {
             "admin.html",
             "login.html",
             "interstitial.html",
+            "notice.html",
         ] {
             let html = assets.get(page).unwrap().as_text().unwrap().into_owned();
             for path in referenced(&html) {
@@ -348,6 +351,100 @@ mod tests {
                 Some(rest[..end].to_string())
             })
             .collect()
+    }
+
+    #[test]
+    fn every_import_inside_a_module_resolves() {
+        // 前端没有构建步骤：`from "./links.js"` 写错一个字符，浏览器里就是整页白屏，
+        // 而且只有点开那个页面才发现。这里顺着依赖图把每个 import 走一遍。
+        let assets = embedded();
+
+        let mut pending: Vec<String> = Vec::new();
+        for page in ["index.html", "login.html", "admin.html"] {
+            let html = assets.get(page).unwrap().as_text().unwrap().into_owned();
+            pending.extend(referenced(&html).into_iter().filter(|p| p.ends_with(".js")));
+        }
+        assert!(!pending.is_empty(), "三个页面至少各引一个入口脚本");
+
+        let mut visited = std::collections::HashSet::new();
+        while let Some(path) = pending.pop() {
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+
+            let asset = assets
+                .get(&path)
+                .unwrap_or_else(|| panic!("{path} 被引用但没打进二进制"));
+            let Some(source) = asset.as_text() else {
+                continue;
+            };
+
+            for spec in module_specs(&source) {
+                pending.push(resolve_module(&path, &spec));
+            }
+        }
+
+        // 走到的模块数要说得过去：入口 + core + features 至少十来个
+        assert!(
+            visited.len() >= 10,
+            "依赖图只走到 {} 个文件，像是解析失效了：{visited:?}",
+            visited.len()
+        );
+    }
+
+    /// 抽出 `from "..."` 里的相对模块路径。
+    ///
+    /// 只认 `./` 与 `../` 开头的：裸模块名（`react`）在这个项目里不存在，
+    /// 真出现了也该由打包器而不是这里兜。
+    fn module_specs(source: &str) -> Vec<String> {
+        let mut specs = Vec::new();
+        for marker in ["from \"", "from '"] {
+            let quote = marker.chars().last().expect("marker 非空");
+            let mut rest = source;
+            while let Some(start) = rest.find(marker) {
+                rest = &rest[start + marker.len()..];
+                let Some(end) = rest.find(quote) else { break };
+                specs.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+        specs.retain(|spec| spec.starts_with('.'));
+        specs
+    }
+
+    /// 把 `from` 里的相对说明符解析成清单里的相对路径。
+    fn resolve_module(from: &str, spec: &str) -> String {
+        let mut parts: Vec<&str> = from.split('/').collect();
+        parts.pop(); // 去掉文件名，留下所在目录
+
+        for segment in spec.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+
+        parts.join("/")
+    }
+
+    #[test]
+    fn relative_specifiers_resolve_against_the_importing_file() {
+        // 单独钉一下解析规则：它错了，上面那个用例会「全都找不到」
+        assert_eq!(
+            resolve_module("assets/js/pages/admin/index.js", "./links.js"),
+            "assets/js/pages/admin/links.js"
+        );
+        assert_eq!(
+            resolve_module("assets/js/pages/admin/index.js", "../../core/dom.js"),
+            "assets/js/core/dom.js"
+        );
+        assert_eq!(
+            resolve_module("assets/js/pages/home.js", "../core/http.js"),
+            "assets/js/core/http.js"
+        );
     }
 
     #[test]
@@ -418,6 +515,7 @@ mod tests {
             "admin.html",
             "login.html",
             "interstitial.html",
+            "notice.html",
         ] {
             std::fs::write(root.join(name), "<html><body></body></html>").unwrap();
         }

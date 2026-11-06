@@ -1,0 +1,12 @@
+{
+  "name": "shortlink-rs-web-test",
+  "private": true,
+  "type": "module",
+  "description": "前端模块的单元测试（node --test + jsdom），不参与发布",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.0"
+  }
+}

@@ -16,7 +16,6 @@ struct AppConfig {
     site_name: String,
     /// 同源部署时为空串；反代到子路径时是 `/sub` 这类前缀
     api_base: String,
-    admin_enabled: bool,
     live_reload: bool,
     assets_stamp: &'static str,
 }
@@ -27,7 +26,6 @@ pub async fn app_config(state: web::Data<AppState>) -> HttpResponse {
         env: state.profile.as_str(),
         site_name: state.site_name.clone(),
         api_base: state.api_base.clone(),
-        admin_enabled: state.admin.is_enabled(),
         live_reload: state.assets.live_reload(),
         assets_stamp: crate::assets::ASSET_STAMP,
     };

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>管理后台 · shortlink</title>
+    <title>后台 · shortlink</title>
     <meta name="robots" content="noindex, nofollow" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="assets/css/base.css" />
@@ -24,47 +24,90 @@
               fill="none"
             />
           </svg>
-          <span>shortlink</span>
+          <span class="topbar__name">shortlink</span>
           <span class="topbar__tag">后台</span>
         </a>
 
         <div class="topbar__actions" id="topbar-actions" hidden>
+          <span class="topbar__user" id="topbar-user"></span>
+          <span class="topbar__tag" id="topbar-role" hidden>管理员</span>
+          <a class="button button--ghost" href="/">返回首页</a>
           <button class="button button--ghost" type="button" id="sign-out">退出</button>
         </div>
       </header>
 
+      <!-- 未登录：脚本在启动时就会把人送去登录页，这里只留给「会话中途失效」 -->
       <section class="gate" id="gate" hidden>
-        <h1>管理后台</h1>
+        <h1>需要登录</h1>
+        <p class="gate__lead" id="gate-message">
+          这个页面要登录后才能看。如果刚被登出，重新登录一次就好。
+        </p>
+        <a class="button button--primary" id="gate-sign-in" href="/login?next=/admin">去登录</a>
+      </section>
+
+      <!-- 临时口令未更换：除了改密什么都做不了 -->
+      <section class="gate" id="password-gate" hidden>
+        <h1>先改一下密码</h1>
         <p class="gate__lead">
-          输入服务端配置的 <code>ADMIN_TOKEN</code>。只保存在当前标签页，关掉即失效。
+          你用的是一次性口令。改成自己的密码后才能继续 —— 之后拿新密码登录，旧口令立即失效。
         </p>
 
-        <form id="gate-form" novalidate>
-          <label class="gate__label" for="token">访问口令</label>
-          <input
-            id="token"
-            name="token"
-            type="password"
-            autocomplete="current-password"
-            placeholder="ADMIN_TOKEN"
-            spellcheck="false"
-          />
-          <p class="gate__error" id="gate-error" role="alert" hidden></p>
-          <button class="button button--primary" type="submit" id="gate-submit">
-            <span class="button__label">进入</span>
+        <form id="password-form" novalidate>
+          <div class="field">
+            <label for="current-password">当前口令</label>
+            <input id="current-password" type="password" autocomplete="current-password" spellcheck="false" />
+          </div>
+          <div class="field">
+            <label for="new-password">新密码</label>
+            <input id="new-password" type="password" autocomplete="new-password" />
+            <p class="field__hint">至少 8 位，区分大小写。</p>
+          </div>
+          <div class="field">
+            <label for="confirm-password">确认新密码</label>
+            <input id="confirm-password" type="password" autocomplete="new-password" />
+          </div>
+          <p class="gate__error" id="password-error" role="alert" hidden></p>
+          <button class="button button--primary" type="submit" id="password-submit">
+            <span class="button__label">保存并进入</span>
             <span class="spinner" aria-hidden="true"></span>
           </button>
         </form>
       </section>
 
       <main id="console" hidden>
+        <div class="tabs" role="tablist" aria-label="后台分区">
+          <button
+            class="tab tab--active"
+            type="button"
+            role="tab"
+            id="tab-links"
+            data-tab="links"
+            aria-selected="true"
+            aria-controls="panel-links"
+          >
+            短链
+          </button>
+          <button
+            class="tab"
+            type="button"
+            role="tab"
+            id="tab-users"
+            data-tab="users"
+            aria-selected="false"
+            aria-controls="panel-users"
+            hidden
+          >
+            用户
+          </button>
+        </div>
+
         <section class="stats" aria-label="概览">
           <article class="stat">
-            <span class="stat__label">总链接</span>
+            <span class="stat__label" id="stat-total-label">总链接</span>
             <strong class="stat__value" id="stat-total">—</strong>
           </article>
           <article class="stat">
-            <span class="stat__label">总访问</span>
+            <span class="stat__label" id="stat-visits-label">总访问</span>
             <strong class="stat__value" id="stat-visits">—</strong>
             <span class="stat__hint">已回刷到库</span>
           </article>
@@ -78,8 +121,8 @@
           </article>
         </section>
 
-        <section class="board" aria-labelledby="board-title">
-          <h2 class="visually-hidden" id="board-title">短链列表</h2>
+        <section class="board" id="panel-links" role="tabpanel" aria-labelledby="tab-links">
+          <h2 class="visually-hidden">短链列表</h2>
 
           <div class="toolbar">
             <input
@@ -98,6 +141,11 @@
               <button class="segmented__item" type="button" data-status="exhausted">已达上限</button>
             </div>
 
+            <p class="chip" id="owner-filter" hidden>
+              <span class="chip__text">只看 <strong id="owner-filter-name"></strong></span>
+              <button class="chip__close" type="button" id="owner-filter-clear" aria-label="取消筛选">×</button>
+            </p>
+
             <button class="button button--ghost" type="button" id="refresh">刷新</button>
           </div>
 
@@ -108,6 +156,7 @@
               <thead>
                 <tr>
                   <th scope="col">短码</th>
+                  <th scope="col" id="col-owner" hidden>归属</th>
                   <th scope="col">目标地址</th>
                   <th scope="col" class="table__num">访问</th>
                   <th scope="col">状态</th>
@@ -130,11 +179,72 @@
             </div>
           </footer>
         </section>
+
+        <!-- 仅管理员可见：入口由脚本按角色打开 -->
+        <section class="board" id="panel-users" role="tabpanel" aria-labelledby="tab-users" hidden>
+          <h2 class="visually-hidden">用户列表</h2>
+
+          <div class="toolbar">
+            <input
+              class="toolbar__search"
+              id="user-search"
+              type="search"
+              placeholder="搜索邮箱或昵称"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button class="button button--ghost" type="button" id="user-refresh">刷新</button>
+          </div>
+
+          <p class="board__error" id="users-error" role="alert" hidden></p>
+
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th scope="col">账号</th>
+                  <th scope="col">角色</th>
+                  <th scope="col">状态</th>
+                  <th scope="col" class="table__num">短链</th>
+                  <th scope="col">注册</th>
+                  <th scope="col"><span class="visually-hidden">操作</span></th>
+                </tr>
+              </thead>
+              <tbody id="user-rows"></tbody>
+            </table>
+          </div>
+
+          <p class="empty" id="users-empty" hidden>没有匹配的账号。</p>
+
+          <footer class="pager">
+            <span class="pager__info" id="user-pager-info"></span>
+            <div class="pager__actions">
+              <button class="button button--ghost" type="button" id="user-prev">上一页</button>
+              <button class="button button--ghost" type="button" id="user-next">下一页</button>
+            </div>
+          </footer>
+        </section>
       </main>
+    </div>
+
+    <!-- 一次性口令：关掉就再也看不到，只能重新重置 -->
+    <div class="overlay" id="credential" hidden>
+      <div class="overlay__card" role="dialog" aria-modal="true" aria-labelledby="credential-title">
+        <h2 class="overlay__title" id="credential-title">新的临时口令</h2>
+        <p class="overlay__lead">
+          交给 <strong id="credential-email"></strong>。关掉这张卡片就看不到了，只能重新重置一次。
+        </p>
+        <p class="credential" id="credential-password"></p>
+        <p class="overlay__hint">对方首次登录后必须先改成自己的密码。</p>
+        <div class="overlay__actions">
+          <button class="button button--ghost" type="button" id="credential-copy">复制</button>
+          <button class="button button--primary" type="button" id="credential-close">我已记下</button>
+        </div>
+      </div>
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-    <script type="module" src="assets/js/pages/admin.js"></script>
+    <script type="module" src="assets/js/pages/admin/index.js"></script>
   </body>
 </html>

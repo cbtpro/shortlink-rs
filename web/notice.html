@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- 失效的链接不该被搜索引擎收录，也不该把来源信息带给任何人 -->
+    <meta name="robots" content="noindex" />
+    <meta name="referrer" content="no-referrer" />
+    <title>{{title}} · shortlink</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23b4471f'/%3E%3Cpath d='M12 20l8-8M13 11h-2a5 5 0 000 10h2M19 21h2a5 5 0 000-10h-2' stroke='%23fff' stroke-width='2' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="assets/css/base.css" />
+    <link rel="stylesheet" href="assets/css/interstitial.css" />
+    <link rel="stylesheet" href="assets/css/notice.css" />
+  </head>
+  <body>
+    <main class="gate">
+      <p class="gate__kicker">{{kicker}}</p>
+      <h1>{{title}}</h1>
+      <p class="gate__lead">{{lead}}</p>
+
+      {{#password}}
+      <!-- 表单提交到当前地址（POST），密码走请求体，不落到 URL、历史和日志里 -->
+      <form class="gate__form" method="post">
+        <label class="gate__label" for="notice-password">访问密码</label>
+        <input
+          id="notice-password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          maxlength="64"
+          placeholder="输入访问密码"
+          required
+          autofocus
+        />
+        <button class="button button--primary" type="submit">继续访问</button>
+      </form>
+      {{/password}}
+
+      <div class="gate__actions">
+        <a class="button" href="/">返回首页</a>
+      </div>
+
+      <p class="gate__foot">短码 <code>{{code}}</code></p>
+    </main>
+  </body>
+</html>

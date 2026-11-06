@@ -11,11 +11,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::cache::{CacheError, LinkCache, PendingVisit, VisitCounter};
+use crate::cache::{CacheError, GateTicket, LinkCache, PendingVisit, VisitCounter};
 use crate::domain::code::ShortCodeGenerator;
 use crate::domain::short_link::CachedLink;
 use crate::repository::{
     LinkOverview, LinkPage, LinkQuery, LinkRepository, OverviewWindow, RepoError,
+    SessionRepository, UserPage, UserQuery, UserRepository,
 };
 use crate::types::BoxFuture;
 
@@ -183,6 +184,63 @@ impl VisitCounter for BrokenCounter {
     }
 
     fn consume<'a>(&'a self, _visit: PendingVisit) -> BoxFuture<'a, Result<(), CacheError>> {
+        Box::pin(async { Err(backend_failure()) })
+    }
+}
+
+/// 内存版票据仓库：签发即登记，兑换一次即失效。
+#[derive(Default)]
+pub struct InMemoryGateTicket {
+    /// 票据 -> 绑定的短码
+    issued: Mutex<HashMap<String, String>>,
+}
+
+impl InMemoryGateTicket {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 当前还没被兑换的票据数量。
+    pub fn outstanding(&self) -> usize {
+        self.issued.lock().expect("ticket mutex poisoned").len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.issued.lock().expect("ticket mutex poisoned")
+    }
+}
+
+impl GateTicket for InMemoryGateTicket {
+    fn issue<'a>(
+        &'a self,
+        code: &'a str,
+        _ttl: Duration,
+    ) -> BoxFuture<'a, Result<String, CacheError>> {
+        // 令牌本身不需要仿真：只要唯一、可放进 URL 就够了
+        let ticket = format!("ticket-{}", self.outstanding() + 1);
+        self.lock().insert(ticket.clone(), code.to_string());
+        Box::pin(async move { Ok(ticket) })
+    }
+
+    fn redeem<'a>(&'a self, ticket: &'a str) -> BoxFuture<'a, Result<Option<String>, CacheError>> {
+        let code = self.lock().remove(ticket);
+        Box::pin(async move { Ok(code) })
+    }
+}
+
+/// 所有操作都失败的票据仓库：用来验证「Redis 挂了，中转页还能走」。
+pub struct BrokenGateTicket;
+
+impl GateTicket for BrokenGateTicket {
+    fn issue<'a>(
+        &'a self,
+        _code: &'a str,
+        _ttl: Duration,
+    ) -> BoxFuture<'a, Result<String, CacheError>> {
+        Box::pin(async { Err(backend_failure()) })
+    }
+
+    fn redeem<'a>(&'a self, _ticket: &'a str) -> BoxFuture<'a, Result<Option<String>, CacheError>> {
         Box::pin(async { Err(backend_failure()) })
     }
 }
@@ -368,7 +426,11 @@ impl LinkRepository for BrokenRepository {
         Box::pin(async { Err(repo_failure()) })
     }
 
-    fn overview(&self, _window: OverviewWindow) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
+    fn overview(
+        &self,
+        _window: OverviewWindow,
+        _owner: Option<u64>,
+    ) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
         Box::pin(async { Err(repo_failure()) })
     }
 
@@ -393,6 +455,99 @@ impl LinkRepository for BrokenRepository {
     }
 
     fn delete_all_owned(&self, _owner_id: u64) -> BoxFuture<'_, Result<Vec<String>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+}
+
+impl UserRepository for BrokenRepository {
+    fn create<'a>(
+        &'a self,
+        _new: &'a crate::domain::account::NewUser,
+        _password_hash: &'a str,
+        _access: crate::domain::account::Access,
+    ) -> BoxFuture<'a, Result<crate::domain::account::User, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn find_by_email<'a>(
+        &'a self,
+        _email: &'a str,
+    ) -> BoxFuture<'a, Result<Option<crate::domain::account::User>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn find_by_id(
+        &self,
+        _id: u64,
+    ) -> BoxFuture<'_, Result<Option<crate::domain::account::User>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn find_by_ids<'a>(
+        &'a self,
+        _ids: &'a [u64],
+    ) -> BoxFuture<'a, Result<Vec<crate::domain::account::User>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn find_first_admin(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<crate::domain::account::User>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn list_users<'a>(
+        &'a self,
+        _query: &'a UserQuery,
+    ) -> BoxFuture<'a, Result<UserPage, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn set_password<'a>(
+        &'a self,
+        _id: u64,
+        _password_hash: &'a str,
+        _must_change_password: bool,
+    ) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn set_status(
+        &self,
+        _id: u64,
+        _status: crate::domain::account::AccountStatus,
+    ) -> BoxFuture<'_, Result<bool, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+}
+
+impl SessionRepository for BrokenRepository {
+    fn create<'a>(
+        &'a self,
+        _user_id: u64,
+        _token_hash: &'a str,
+        _expires_at: chrono::NaiveDateTime,
+    ) -> BoxFuture<'a, Result<(), RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn find_user<'a>(
+        &'a self,
+        _token_hash: &'a str,
+        _now: chrono::NaiveDateTime,
+    ) -> BoxFuture<'a, Result<Option<crate::domain::account::User>, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn delete<'a>(&'a self, _token_hash: &'a str) -> BoxFuture<'a, Result<bool, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn delete_for_user(&self, _user_id: u64) -> BoxFuture<'_, Result<u64, RepoError>> {
+        Box::pin(async { Err(repo_failure()) })
+    }
+
+    fn purge_expired(&self, _now: chrono::NaiveDateTime) -> BoxFuture<'_, Result<u64, RepoError>> {
         Box::pin(async { Err(repo_failure()) })
     }
 }

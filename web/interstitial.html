@@ -23,7 +23,8 @@
       <p class="gate__url">{{url}}</p>
 
       <div class="gate__actions">
-        <a class="button button--primary" href="{{url}}" rel="noopener noreferrer">继续访问</a>
+        <!-- 走服务端换一次跳转：只有点下去，这次访问才被记上 -->
+        <a class="button button--primary" href="{{next}}" rel="noopener noreferrer">继续访问</a>
         <a class="button" href="./">返回首页</a>
       </div>
 

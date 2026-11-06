@@ -89,6 +89,10 @@ pub struct AccessRequest<'a> {
     pub password: Option<&'a str>,
     /// 尚未回刷到数据库的访问增量
     pub pending_visits: u32,
+    /// 身份已经用别的方式证明过（中转页票据），不必再验密码。
+    ///
+    /// 只有服务端自己签发的票据能把它置为 `true`；请求参数里没有这个开关。
+    pub authenticated: bool,
 }
 
 /// 访问被拒绝的原因。
@@ -122,11 +126,13 @@ impl AccessPolicy {
             return Err(AccessDenial::Expired);
         }
 
-        if let Some(expected) = self.password.as_deref() {
-            match request.password {
-                None => return Err(AccessDenial::MissingPassword),
-                Some(given) if given == expected => {}
-                Some(_) => return Err(AccessDenial::InvalidPassword),
+        if !request.authenticated {
+            if let Some(expected) = self.password.as_deref() {
+                match request.password {
+                    None => return Err(AccessDenial::MissingPassword),
+                    Some(given) if given == expected => {}
+                    Some(_) => return Err(AccessDenial::InvalidPassword),
+                }
             }
         }
 
@@ -188,6 +194,17 @@ mod tests {
             now,
             password,
             pending_visits: 0,
+            authenticated: false,
+        }
+    }
+
+    /// 已经验过身份的请求（中转页点「继续访问」）。
+    fn authenticated(now: NaiveDateTime) -> AccessRequest<'static> {
+        AccessRequest {
+            now,
+            password: None,
+            pending_visits: 0,
+            authenticated: true,
         }
     }
 
@@ -231,6 +248,24 @@ mod tests {
 
         // 没设密码时带不带都放行
         assert!(policy(None, None).check(&request(at(12), None)).is_ok());
+    }
+
+    #[test]
+    fn authenticated_requests_skip_the_password_but_not_the_other_rules() {
+        let mut p = policy(Some(at(12)), Some(1));
+        p.password = Some("secret".into());
+
+        // 票据证明身份后不再索要密码
+        assert!(p.check(&authenticated(at(11))).is_ok());
+
+        // 过期与次数上限照旧生效：中转页停留期间链接可能已经失效
+        assert_eq!(p.check(&authenticated(at(13))), Err(AccessDenial::Expired));
+
+        p.visit_count = 1;
+        assert_eq!(
+            p.check(&authenticated(at(11))),
+            Err(AccessDenial::VisitLimitReached)
+        );
     }
 
     #[test]

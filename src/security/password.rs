@@ -9,6 +9,7 @@
 //! 这样将来提高迭代次数时，老口令仍能用它自己的参数验证，不需要强制所有人改密码。
 
 use hmac::{Hmac, Mac};
+use rand::seq::IndexedRandom;
 use rand::Rng;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -128,6 +129,26 @@ fn new_mac(password: &[u8]) -> HmacSha256 {
 
 fn random_salt() -> [u8; SALT_LEN] {
     rand::rng().random()
+}
+
+/// 生成一次性口令，用于管理员初始密码与重置密码。
+///
+/// 字母表刻意去掉 `0/O`、`1/l/I` —— 这个口令要用户手抄一遍再登录，
+/// 分不清的字符只会换来一次失败尝试。52 + 8 = 60 个符号，20 位约 118 bit，
+/// 在「改密前有效、改密后作废」的窗口里足够。
+const PASSWORD_ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+pub fn random_password(length: usize) -> String {
+    let mut rng = rand::rng();
+    (0..length.clamp(8, 64))
+        .map(|_| {
+            let index = PASSWORD_ALPHABET
+                .choose(&mut rng)
+                .copied()
+                .expect("alphabet is never empty");
+            char::from(index)
+        })
+        .collect()
 }
 
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
@@ -250,5 +271,28 @@ mod tests {
             to_hex(&derived),
             "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
         );
+    }
+
+    #[test]
+    fn random_password_is_long_and_unambiguous() {
+        let first = random_password(20);
+        let second = random_password(20);
+
+        assert_eq!(first.chars().count(), 20);
+        assert_ne!(first, second, "两次生成不能相同");
+        for ch in first.chars() {
+            assert!(
+                PASSWORD_ALPHABET.contains(&(ch as u8)),
+                "{ch} 不在可用字符集里"
+            );
+            assert!(!"0O1lI".contains(ch), "易混字符不该出现在要手抄的口令里");
+        }
+    }
+
+    #[test]
+    fn random_password_keeps_a_usable_length() {
+        // 传 0 会生成空串，直接绕口令规则；此处收敛到下限
+        assert_eq!(random_password(0).chars().count(), 8);
+        assert_eq!(random_password(999).chars().count(), 64);
     }
 }

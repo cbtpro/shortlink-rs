@@ -29,12 +29,12 @@ const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 3600;
-const DEFAULT_VISIT_FLUSH_SECONDS: u64 = 300;
+/// 回刷周期。库是事实来源，周期太长会让后台的统计、导出长期落后于实际访问量。
+/// 60 秒一次 SCAN 对 Redis 来说可以忽略，换来的是「一分钟内落库」。
+const DEFAULT_VISIT_FLUSH_SECONDS: u64 = 60;
 const DEFAULT_CODE_LENGTH: usize = 7;
 /// 与 `short_links.code VARCHAR(10)` 保持一致
 pub const MAX_CODE_LENGTH: usize = 10;
-/// 低于 8 位的令牌在暴力枚举下形同虚设
-const MIN_ADMIN_TOKEN_LENGTH: usize = 8;
 /// 首页「最近创建」保留多少条
 const DEFAULT_RECENT_LIMIT: u32 = 20;
 /// 登录会话有效期
@@ -43,6 +43,10 @@ const DEFAULT_SESSION_TTL_DAYS: u64 = 30;
 const DEFAULT_PASSWORD_ITERATIONS: u32 = crate::security::password::DEFAULT_ITERATIONS;
 const DEFAULT_ASSETS_ROOT: &str = "web";
 const DEFAULT_SITE_NAME: &str = "shortlink";
+/// 初始化管理员账号。这里只是个合法邮箱，不接收任何邮件。
+const DEFAULT_ADMIN_EMAIL: &str = "admin@shortlink.local";
+/// 初始化口令写到哪里。放在 `data/` 下，与日志、上传等运行期产物同处。
+const DEFAULT_ADMIN_PASSWORD_FILE: &str = "data/admin-initial-password.txt";
 
 /// 运行环境。只影响默认值，不改变任何业务分支。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,8 +176,10 @@ pub struct LinkConfig {
 
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
-    /// 后台访问令牌。`None` 表示未启用后台，相关路由一律 404。
-    pub token: Option<String>,
+    /// 初始化管理员的登录邮箱。库里没有管理员时才会用到。
+    pub email: String,
+    /// 初始密码写出的位置。管理员改完密码后文件会被删除。
+    pub password_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -325,7 +331,12 @@ impl Config {
                 max_code_length: MAX_CODE_LENGTH,
             },
             admin: AdminConfig {
-                token: parse_token("ADMIN_TOKEN", source.text("ADMIN_TOKEN").as_deref())?,
+                email: parse_admin_email(source.text("ADMIN_EMAIL"))?,
+                password_file: PathBuf::from(
+                    source
+                        .text("ADMIN_PASSWORD_FILE")
+                        .unwrap_or_else(|| DEFAULT_ADMIN_PASSWORD_FILE.to_string()),
+                ),
             },
             auth: AuthConfig {
                 session_ttl: Duration::from_secs(session_ttl_days * 24 * 60 * 60),
@@ -351,7 +362,7 @@ impl Config {
     pub fn summary(&self) -> String {
         format!(
             "profile={} addr={}:{} public={} db={} redis={} assets={} live_reload={} \
-             admin={} session_ttl={}d password_iterations={}",
+             admin={} password_file={} session_ttl={}d password_iterations={}",
             self.profile,
             self.server.host,
             self.server.port,
@@ -360,11 +371,8 @@ impl Config {
             redact_credentials(&self.redis.url),
             self.assets.mode.as_str(),
             if self.assets.live_reload { "on" } else { "off" },
-            if self.admin.token.is_some() {
-                "enabled"
-            } else {
-                "disabled"
-            },
+            self.admin.email,
+            self.admin.password_file.display(),
             self.auth.session_ttl.as_secs() / (24 * 60 * 60),
             self.auth.password_iterations,
         )
@@ -484,23 +492,21 @@ fn describe(layer: &Layer) -> String {
     }
 }
 
-/// 解析后台令牌。
+/// 解析初始化管理员的邮箱。
 ///
-/// 空串等同未配置（方便用 `.env` 占位），非空但过短直接报错 ——
-/// 与其带着一个可被枚举的口令上线，不如启动时失败。
-fn parse_token(key: &str, raw: Option<&str>) -> Result<Option<String>> {
-    let Some(raw) = raw else { return Ok(None) };
+/// 空串按默认值处理；写错了直接启动失败 —— 一个不合法的邮箱会让管理员
+/// 永远建不出来，而那条错误直到第一次启动才会以 SQL 约束的形式出现。
+fn parse_admin_email(raw: Option<String>) -> Result<String> {
+    let email = raw.unwrap_or_else(|| DEFAULT_ADMIN_EMAIL.to_string());
+    let normalized = email.trim().to_ascii_lowercase();
 
-    let token = raw.trim();
-    if token.is_empty() {
-        return Ok(None);
-    }
-    if token.chars().count() < MIN_ADMIN_TOKEN_LENGTH {
+    if !crate::domain::account::is_valid_email(&normalized) {
         return Err(anyhow!(
-            "`{key}` must be at least {MIN_ADMIN_TOKEN_LENGTH} characters"
+            "`ADMIN_EMAIL` is not a valid address: `{email}` (expected something like admin@example.com)"
         ));
     }
-    Ok(Some(token.to_string()))
+
+    Ok(normalized)
 }
 
 /// 隐去连接串里的凭据，只保留协议、主机与库名，用于日志与报错展示。
@@ -600,7 +606,11 @@ mod tests {
             Duration::from_secs(DEFAULT_SESSION_TTL_DAYS * 24 * 60 * 60)
         );
         assert_eq!(config.auth.password_iterations, DEFAULT_PASSWORD_ITERATIONS);
-        assert!(config.admin.token.is_none());
+        assert_eq!(config.admin.email, DEFAULT_ADMIN_EMAIL);
+        assert_eq!(
+            config.admin.password_file,
+            PathBuf::from(DEFAULT_ADMIN_PASSWORD_FILE)
+        );
         assert_eq!(config.site.name, "shortlink");
     }
 
@@ -690,23 +700,43 @@ mod tests {
     }
 
     #[test]
-    fn blank_admin_token_disables_admin() {
-        assert_eq!(parse_token("ADMIN_TOKEN", None).unwrap(), None);
-        assert_eq!(parse_token("ADMIN_TOKEN", Some("   ")).unwrap(), None);
+    fn admin_email_falls_back_to_the_default() {
+        assert_eq!(parse_admin_email(None).unwrap(), DEFAULT_ADMIN_EMAIL);
     }
 
     #[test]
-    fn admin_token_is_trimmed() {
+    fn admin_email_is_normalized() {
         assert_eq!(
-            parse_token("ADMIN_TOKEN", Some("  s3cret-token  ")).unwrap(),
-            Some("s3cret-token".to_string())
+            parse_admin_email(Some("  Root@Example.COM ".into())).unwrap(),
+            "root@example.com"
         );
     }
 
     #[test]
-    fn short_admin_token_is_rejected() {
-        // 与其带着可枚举的口令上线，不如启动时失败
-        assert!(parse_token("ADMIN_TOKEN", Some("short")).is_err());
+    fn invalid_admin_email_fails_fast() {
+        // 一个不合法的邮箱会让管理员永远建不出来，且错误要到第一次启动才暴露
+        for bad in [
+            "admin",
+            "admin@localhost",
+            "@example.com",
+            "中文@example.com",
+        ] {
+            assert!(
+                parse_admin_email(Some(bad.into())).is_err(),
+                "{bad} 应被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_password_file_is_configurable() {
+        let mut pairs = minimal();
+        pairs.push(("ADMIN_PASSWORD_FILE", "/tmp/secret.txt"));
+        pairs.push(("ADMIN_EMAIL", "owner@example.com"));
+
+        let config = config_with(&pairs).unwrap();
+        assert_eq!(config.admin.password_file, PathBuf::from("/tmp/secret.txt"));
+        assert_eq!(config.admin.email, "owner@example.com");
     }
 
     #[test]

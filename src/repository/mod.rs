@@ -4,7 +4,7 @@ use std::fmt;
 
 use chrono::NaiveDateTime;
 
-use crate::domain::account::{NewUser, User};
+use crate::domain::account::{Access, AccountStatus, NewUser, User};
 use crate::domain::new_link::NewShortLink;
 use crate::domain::short_link::ShortLink;
 use crate::types::BoxFuture;
@@ -70,6 +70,8 @@ pub struct LinkQuery {
     pub page_size: u32,
     pub keyword: Option<String>,
     pub filter: LinkFilter,
+    /// 只看某人名下的链接。`None` 表示不限归属（仅管理员）
+    pub owner: Option<u64>,
 }
 
 /// 一页结果。
@@ -135,8 +137,12 @@ pub trait LinkRepository: Send + Sync {
         now: NaiveDateTime,
     ) -> BoxFuture<'a, Result<LinkPage, RepoError>>;
 
-    /// 概览统计。
-    fn overview(&self, window: OverviewWindow) -> BoxFuture<'_, Result<LinkOverview, RepoError>>;
+    /// 概览统计。`owner` 为 `None` 时统计全站，否则只统计某人名下。
+    fn overview(
+        &self,
+        window: OverviewWindow,
+        owner: Option<u64>,
+    ) -> BoxFuture<'_, Result<LinkOverview, RepoError>>;
 
     /// 按短码删除，返回是否真的删掉了记录。
     fn delete_by_code<'a>(&'a self, code: &'a str) -> BoxFuture<'a, Result<bool, RepoError>>;
@@ -194,6 +200,32 @@ pub trait CreationHistory: Send + Sync {
     fn clear<'a>(&'a self, visitor: &'a str) -> BoxFuture<'a, Result<u64, RepoError>>;
 }
 
+/// 用户列表的查询条件。
+#[derive(Clone, Debug)]
+pub struct UserQuery {
+    /// 从 1 开始
+    pub page: u32,
+    pub page_size: u32,
+    /// 关键字，同时匹配邮箱与昵称
+    pub keyword: Option<String>,
+}
+
+/// 用户列表行：账号本身 + 名下短链数量。
+///
+/// 短链数是列表里最有用的那个数字（判断是不是空号），用一个 LEFT JOIN 带出来，
+/// 比前端逐行再查一次要省得多。
+#[derive(Clone, Debug)]
+pub struct UserSummary {
+    pub user: User,
+    pub link_count: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct UserPage {
+    pub items: Vec<UserSummary>,
+    pub total: u64,
+}
+
 /// 账号仓储。
 ///
 /// 与短链仓储分开：两者的唯一约束、查询维度、生命周期都不一样，
@@ -205,12 +237,36 @@ pub trait UserRepository: Send + Sync {
         &'a self,
         new: &'a NewUser,
         password_hash: &'a str,
+        access: Access,
     ) -> BoxFuture<'a, Result<User, RepoError>>;
 
     fn find_by_email<'a>(
         &'a self,
         email: &'a str,
     ) -> BoxFuture<'a, Result<Option<User>, RepoError>>;
+
+    fn find_by_id(&self, id: u64) -> BoxFuture<'_, Result<Option<User>, RepoError>>;
+
+    /// 批量取用户，用于给列表补「归属」。不存在的 id 直接缺席。
+    fn find_by_ids<'a>(&'a self, ids: &'a [u64]) -> BoxFuture<'a, Result<Vec<User>, RepoError>>;
+
+    /// 第一个管理员。初始化时用它判断要不要生成管理员账号。
+    fn find_first_admin(&self) -> BoxFuture<'_, Result<Option<User>, RepoError>>;
+
+    /// 分页列出用户，按 id 倒序（新注册的在前）。
+    fn list_users<'a>(&'a self, query: &'a UserQuery)
+        -> BoxFuture<'a, Result<UserPage, RepoError>>;
+
+    /// 覆盖口令散列，并设置「下次登录必须改密」。返回是否命中该用户。
+    fn set_password<'a>(
+        &'a self,
+        id: u64,
+        password_hash: &'a str,
+        must_change_password: bool,
+    ) -> BoxFuture<'a, Result<bool, RepoError>>;
+
+    /// 启用 / 禁用，返回是否命中该用户。
+    fn set_status(&self, id: u64, status: AccountStatus) -> BoxFuture<'_, Result<bool, RepoError>>;
 }
 
 /// 会话仓储。
@@ -233,6 +289,12 @@ pub trait SessionRepository: Send + Sync {
 
     /// 注销单个会话，返回是否命中。
     fn delete<'a>(&'a self, token_hash: &'a str) -> BoxFuture<'a, Result<bool, RepoError>>;
+
+    /// 注销某人全部会话，返回删除条数。
+    ///
+    /// 改密、重置、禁用之后必须调用：否则旧设备上还拿着能用的令牌，
+    /// 「密码已更换」就等于一句空话。
+    fn delete_for_user(&self, user_id: u64) -> BoxFuture<'_, Result<u64, RepoError>>;
 
     /// 清理过期会话，返回删除条数。由后台任务定期调用。
     fn purge_expired(&self, now: NaiveDateTime) -> BoxFuture<'_, Result<u64, RepoError>>;

@@ -41,7 +41,7 @@ pub fn fmt(check: bool) -> bool {
     shell::run_checked("cargo", &args)
 }
 
-/// 提交前跑一遍：格式、lint、测试。三者任一失败即中断。
+/// 提交前跑一遍：格式、lint、测试。任一失败即中断。
 pub fn check() -> bool {
     if !fmt(true) {
         eprintln!("格式不符合 rustfmt，执行 `cargo xtask fmt` 修正");
@@ -57,7 +57,41 @@ pub fn check() -> bool {
     }
 
     println!("$ cargo test");
-    shell::run_checked("cargo", &["test"])
+    if !shell::run_checked("cargo", &["test"]) {
+        return false;
+    }
+
+    if !web_test(false) {
+        eprintln!("前端用例未通过，单独复跑：cargo xtask web-test");
+        return false;
+    }
+
+    true
+}
+
+/// 前端测试的工作目录。
+const WEB_TEST_DIR: &str = "web-test";
+
+/// 前端单元测试：`node --test` + jsdom，被测的是 `web/` 里那几个文件本身，
+/// 不打包、不转译 —— 断言跑的就是线上加载的同一份代码。
+///
+/// 依赖不参与 Rust 构建，所以分两种口径：独立命令（`strict`）缺依赖直接失败，
+/// 免得以为「跑过了」；`check` 里则跳过并给出安装命令，不让没装 node 的机器被卡住。
+pub fn web_test(strict: bool) -> bool {
+    let dir = Path::new(WEB_TEST_DIR);
+
+    if !dir.join("node_modules").is_dir() {
+        let hint = "前端测试的依赖还没装：cd web-test && npm install";
+        if strict {
+            eprintln!("{hint}");
+            return false;
+        }
+        println!("跳过前端测试（{hint}）");
+        return true;
+    }
+
+    println!("$ node --test   （工作目录 web-test/）");
+    shell::run_checked_in(dir, "node", &["--test"])
 }
 
 fn assemble_dist() -> std::io::Result<()> {
@@ -80,7 +114,7 @@ fn assemble_dist() -> std::io::Result<()> {
         .map(|meta| meta.len())
         .unwrap_or(0);
     println!(
-        "\n发布产物：{}\n  可执行文件 {}（{:.1} MB）\n  配置目录   {}/\n\n启动方式：\n  APP_ENV=production DATABASE_URL=... REDIS_URL=... ADMIN_TOKEN=... ./{}",
+        "\n发布产物：{}\n  可执行文件 {}（{:.1} MB）\n  配置目录   {}/\n\n启动方式：\n  APP_ENV=production DATABASE_URL=... REDIS_URL=... ADMIN_EMAIL=... ./{}",
         dist.display(),
         target.display(),
         size as f64 / 1024.0 / 1024.0,

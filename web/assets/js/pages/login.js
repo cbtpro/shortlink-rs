@@ -1,20 +1,7 @@
 import { $, setBusy } from "../core/dom.js";
 import { applySiteName } from "../core/config.js";
-import { ApiError } from "../core/http.js";
+import { humanize } from "../core/messages.js";
 import * as session from "../core/session.js";
-
-/* 服务端文案 → 中文。没命中的按状态码兜底。 */
-const MESSAGES = {
-  "email is not a valid address": "邮箱格式不对",
-  "password must be at least 8 characters": "密码至少 8 位",
-  "password must be at most 128 characters": "密码最多 128 位",
-  "password must not be blank": "密码不能为空白",
-  "display name must be at most 32 characters": "昵称最多 32 个字",
-  "display name must not contain control characters": "昵称不能包含换行或制表符",
-  "email is already registered": "这个邮箱已经注册过了，直接登录吧",
-  "email or password is incorrect": "邮箱或密码不正确",
-  "request body is not valid": "提交的数据格式不对，刷新页面重试",
-};
 
 const el = {
   form: $("auth-form"),
@@ -31,14 +18,6 @@ const el = {
 };
 
 let mode = "login";
-
-function humanize(error) {
-  if (!(error instanceof ApiError)) return error.message;
-  if (MESSAGES[error.message]) return MESSAGES[error.message];
-  if (error.status === 0) return "连不上服务，请确认服务已启动";
-  if (error.status >= 500) return "服务端出错了，请稍后重试";
-  return error.message;
-}
 
 /**
  * 登录后回到原来要去的页面。

@@ -28,21 +28,29 @@ impl VisitFlusher {
     /// 启动常驻任务。
     pub fn spawn(self, period: Duration) -> JoinHandle<()> {
         tokio::spawn(async move {
+            info!("visit flusher started, period = {period:?}");
+
+            // 先立即回刷一次：上一轮进程在回刷前退出时，增量还留在 Redis 里。
+            // 不补这一次，开发时每次热重启都会把计时器清零，计数就一直落不了库。
+            self.flush_and_log().await;
+
             let mut ticker = interval(period);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            // interval 首次 tick 会立即返回，先消费掉，避免启动瞬间空跑一次
+            // interval 首次 tick 会立即返回，先消费掉，避免紧接着的空跑
             ticker.tick().await;
-
-            info!("visit flusher started, period = {period:?}");
 
             loop {
                 ticker.tick().await;
-                match self.flush_once().await {
-                    Ok(written) => info!("visit flusher persisted {written} link(s)"),
-                    Err(err) => error!("visit flush failed: {err}"),
-                }
+                self.flush_and_log().await;
             }
         })
+    }
+
+    async fn flush_and_log(&self) {
+        match self.flush_once().await {
+            Ok(written) => info!("visit flusher persisted {written} link(s)"),
+            Err(err) => error!("visit flush failed: {err}"),
+        }
     }
 
     /// 执行一次回刷，返回成功写入的链接数量。

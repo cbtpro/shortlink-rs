@@ -2,32 +2,12 @@ import { $, delegate, h, openInNewTab, setBusy } from "../core/dom.js";
 import { apiBase } from "../core/api-base.js";
 import { applySiteName } from "../core/config.js";
 import { ApiError, jsonRequest, request } from "../core/http.js";
+import { humanize } from "../core/messages.js";
 import { timeAgo } from "../core/format.js";
 import { copyText } from "../core/clipboard.js";
 import { toast } from "../core/toast.js";
 import * as session from "../core/session.js";
 import * as recent from "../features/recent-links.js";
-
-/* 服务端校验文案 → 中文，未命中的按状态码兜底 */
-const MESSAGES = {
-  "url must not be empty": "请填写目标地址",
-  "url must be at most 2048 characters": "地址最长 2048 个字符",
-  "url must start with http:// or https://": "只支持 http:// 或 https:// 开头的地址",
-  "url must not contain whitespace": "地址中不能包含空格",
-  "custom code must be 1-10 chars of [A-Za-z0-9-_]": "短码只能是 1–10 位的字母、数字、- 或 _",
-  "password must not be empty": "密码不能为空白",
-  "password must be at most 64 characters": "密码最长 64 位",
-  "password must not contain whitespace": "密码不能包含空格",
-  "password must not contain quotes, backslashes or semicolons":
-    "密码不能包含引号、反斜杠或分号",
-  "password must not contain SQL keywords": "密码不能包含 SQL 关键字",
-  "max_visits must be between 1 and 100000000": "访问次数上限要在 1 到 1 亿之间",
-  "expire_at must be in the future": "有效期必须晚于当前时间",
-  "request body is not valid": "提交的数据格式不对，刷新页面重试",
-  "short code already exists": "这个短码已被占用，换一个试试",
-  "failed to allocate a unique short code, please retry": "短码分配失败，请重试",
-  "short link not found": "这条记录已经不在了",
-};
 
 const el = {
   form: $("create-form"),
@@ -56,14 +36,6 @@ const el = {
 
 /** 列表与删除的语义取决于这个身份，见 features/recent-links.js 的说明 */
 let signedIn = false;
-
-function humanize(error) {
-  if (!(error instanceof ApiError)) return error.message;
-  if (MESSAGES[error.message]) return MESSAGES[error.message];
-  if (error.status === 409) return "这个短码已被占用，换一个试试";
-  if (error.status >= 500) return "服务端出错了，请稍后重试";
-  return error.message;
-}
 
 /* ---------- 校验 ----------
  *
@@ -231,7 +203,9 @@ async function renderRecent() {
     el.empty.textContent =
       error instanceof ApiError && error.status === 0
         ? "读不到记录，服务可能没启动。"
-        : "记录加载失败，刷新页面重试。";
+        : error instanceof ApiError && error.status === 403
+          ? `${humanize(error)}——去后台改完密码再回来。`
+          : "记录加载失败，刷新页面重试。";
     el.empty.hidden = false;
     el.list.replaceChildren();
     el.clear.hidden = true;
@@ -262,6 +236,8 @@ function renderAccount(user) {
       title: user.email,
       text: user.display_name || user.email,
     }),
+    // 后台对每个登录用户都开着：普通用户在那里看自己的短链，管理员还多一个用户页
+    h("a", { class: "link-button", href: "/admin", text: "后台" }),
     h("button", {
       type: "button",
       class: "link-button",
@@ -273,13 +249,20 @@ function renderAccount(user) {
 
 function applyIdentity(user) {
   signedIn = Boolean(user);
+
+  // 临时口令没换掉时，列表接口会被服务端挡回来 —— 与其让列表显示「加载失败」，
+  // 不如直接说清楚要先改密码
+  const pendingPassword = Boolean(user?.must_change_password);
+
   el.recentTitle.textContent = signedIn ? "我的链接" : "最近创建";
   el.footerNote.textContent = signedIn
     ? `已登录 ${user.email}`
     : "未登录：记录按浏览器保存";
-  el.empty.textContent = signedIn
-    ? "还没有创建过短链。"
-    : "还没有记录。创建过的短链会记在这个浏览器下。";
+  el.empty.textContent = pendingPassword
+    ? "你用的是临时口令，去后台改完密码后才能看到链接。"
+    : signedIn
+      ? "还没有创建过短链。"
+      : "还没有记录。创建过的短链会记在这个浏览器下。";
 }
 
 async function onLogout() {

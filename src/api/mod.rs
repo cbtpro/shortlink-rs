@@ -4,16 +4,18 @@ pub mod dto;
 pub mod session;
 pub mod visitor;
 
-mod admin;
 mod app_config;
 mod assets;
 mod auth;
+mod console;
 mod dev;
 mod health;
 mod history;
 mod interstitial;
+mod notice;
 mod redirect;
 mod shorten;
+mod template;
 
 use actix_web::web;
 
@@ -27,6 +29,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     // 「请求失败（HTTP 400）」；更糟的是解析器的原话里带着 Rust 类型名。
     cfg.app_data(web::JsonConfig::default().error_handler(|error, _| {
         log::debug!("rejected request body: {error}");
+        AppError::InvalidBody.into()
+    }));
+
+    // 密码表单同理：解析失败不该漏出 actix 的纯文本 400
+    cfg.app_data(web::FormConfig::default().error_handler(|error, _| {
+        log::debug!("rejected form body: {error}");
         AppError::InvalidBody.into()
     }));
 
@@ -50,17 +58,25 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(auth::login);
     cfg.service(auth::logout);
     cfg.service(auth::me);
+    cfg.service(auth::change_password);
 
     cfg.service(shorten::create_link);
     cfg.service(history::list);
     cfg.service(history::forget);
     cfg.service(history::clear);
 
-    cfg.service(admin::overview);
-    cfg.service(admin::list);
-    cfg.service(admin::delete_link);
+    // 控制台：登录用户按角色看到不同的数据，规则在 service::console
+    cfg.service(console::overview);
+    cfg.service(console::list);
+    cfg.service(console::delete_link);
+
+    // 账号管理：只有管理员能进
+    cfg.service(console::list_users);
+    cfg.service(console::reset_password);
+    cfg.service(console::set_status);
 
     cfg.service(redirect::redirect);
+    cfg.service(redirect::submit_password);
 }
 
 #[cfg(test)]
@@ -75,10 +91,11 @@ mod tests {
     use super::configure;
 
     use crate::cache::{LinkCache, VisitCounter};
+    use crate::domain::account::{Access, NewUser, Role, User};
     use crate::domain::code::RandomCodeGenerator;
     use crate::repository::{CreationHistory, LinkRepository, SessionRepository, UserRepository};
-    use crate::service::admin::AdminService;
     use crate::service::auth::AuthService;
+    use crate::service::console::ConsoleService;
     use crate::service::history::HistoryService;
     use crate::service::my_links::MyLinksService;
     use crate::service::redirect::RedirectService;
@@ -86,51 +103,50 @@ mod tests {
     use crate::settings::{AssetsMode, Profile};
     use crate::state::AppState;
     use crate::test_support::{
-        InMemoryLinkRepository, NoOpCache, NoOpCounter, PlainHasher, RecordingCache,
-        RecordingCounter,
+        InMemoryGateTicket, InMemoryLinkRepository, NoOpCache, NoOpCounter, PlainHasher,
+        RecordingCache, RecordingCounter,
     };
 
     const BASE_URL: &str = "http://short.test";
-    const ADMIN_TOKEN: &str = "test-admin-token";
+    /// 测试账号统一用这个口令；`PlainHasher` 把它原样当成散列
+    const PASSWORD: &str = "secret123";
+    const ADMIN_EMAIL: &str = "admin@example.com";
 
     /// 组装一个不依赖 MySQL / Redis 的应用实例。
-    fn state_with(
-        counter: Arc<dyn VisitCounter>,
-        admin_token: Option<&str>,
-    ) -> web::Data<AppState> {
-        state_with_cache(counter, admin_token, Arc::new(NoOpCache))
-    }
-
-    fn state_with_cache(
-        counter: Arc<dyn VisitCounter>,
-        admin_token: Option<&str>,
-        cache: Arc<dyn LinkCache>,
-    ) -> web::Data<AppState> {
-        build_state(counter, admin_token, cache, test_assets())
-    }
-
-    fn build_state(
-        counter: Arc<dyn VisitCounter>,
-        admin_token: Option<&str>,
-        cache: Arc<dyn LinkCache>,
-        assets: Arc<crate::assets::AssetServer>,
-    ) -> web::Data<AppState> {
-        build_state_with(
+    fn state() -> web::Data<AppState> {
+        state_of(
             Arc::new(InMemoryLinkRepository::new()),
-            counter,
-            admin_token,
-            cache,
-            assets,
+            Arc::new(NoOpCounter),
+            Arc::new(NoOpCache),
         )
     }
 
-    /// 同一个组合根，但仓储由调用方给 —— 需要预置数据（比如「已过期的链接」）时用。
+    /// 同一个组合根，但依赖由调用方给 —— 需要预置数据或观察副作用时用。
+    fn state_of(
+        store: Arc<InMemoryLinkRepository>,
+        counter: Arc<dyn VisitCounter>,
+        cache: Arc<dyn LinkCache>,
+    ) -> web::Data<AppState> {
+        build_state(store, counter, cache, test_assets())
+    }
+
+    fn build_state(
+        store: Arc<InMemoryLinkRepository>,
+        counter: Arc<dyn VisitCounter>,
+        cache: Arc<dyn LinkCache>,
+        assets: Arc<crate::assets::AssetServer>,
+    ) -> web::Data<AppState> {
+        build_state_with(store, counter, cache, assets, None)
+    }
+
+    /// 和 `build_state` 一样，但可以指定「初始口令文件」的位置。
+    /// 只有验证「改密后清掉凭据」的用例需要它。
     fn build_state_with(
         store: Arc<InMemoryLinkRepository>,
         counter: Arc<dyn VisitCounter>,
-        admin_token: Option<&str>,
         cache: Arc<dyn LinkCache>,
         assets: Arc<crate::assets::AssetServer>,
+        admin_password_file: Option<std::path::PathBuf>,
     ) -> web::Data<AppState> {
         let repository: Arc<dyn LinkRepository> = store.clone();
         let creations: Arc<dyn CreationHistory> = store.clone();
@@ -147,13 +163,17 @@ mod tests {
         let redirect = Arc::new(RedirectService::new(
             repository.clone(),
             cache.clone(),
-            counter,
+            counter.clone(),
+            Arc::new(InMemoryGateTicket::new()),
             Duration::from_secs(60),
         ));
-        let admin = Arc::new(AdminService::new(
+        let console = Arc::new(ConsoleService::new(
             repository.clone(),
+            users.clone(),
+            sessions.clone(),
             cache.clone(),
-            admin_token.map(str::to_string),
+            counter,
+            Arc::new(PlainHasher),
         ));
         let history = Arc::new(HistoryService::new(creations, 20));
         let my_links = Arc::new(MyLinksService::new(repository, cache, 20));
@@ -168,7 +188,7 @@ mod tests {
         web::Data::new(AppState {
             shorten,
             redirect,
-            admin,
+            console,
             auth,
             my_links,
             history,
@@ -178,6 +198,7 @@ mod tests {
             site_name: "shortlink".to_string(),
             api_base: String::new(),
             cookie_secure: false,
+            admin_password_file,
         })
     }
 
@@ -192,8 +213,21 @@ mod tests {
         )
     }
 
-    fn state() -> web::Data<AppState> {
-        state_with(Arc::new(NoOpCounter), Some(ADMIN_TOKEN))
+    /// 造一份「初始口令文件」，返回路径。调用方负责删掉它所在的目录。
+    fn temp_password_file(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "shortlink-api-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("临时目录应当建得出来");
+        let path = dir.join("admin-initial-password.txt");
+        std::fs::write(&path, "email=admin@example.com\npassword=secret123\n")
+            .expect("凭据文件应当写得进去");
+        path
     }
 
     /// 发送 POST /shorten。
@@ -232,6 +266,61 @@ mod tests {
         B::Error: std::fmt::Debug,
     {
         test::read_body_json(response).await
+    }
+
+    /// 读出响应体文本。跳转失败时给人看的页面走这条。
+    async fn body_text<B>(response: actix_web::dev::ServiceResponse<B>) -> String
+    where
+        B: actix_web::body::MessageBody,
+        B::Error: std::fmt::Debug,
+    {
+        let bytes = test::read_body(response).await;
+        String::from_utf8(bytes.to_vec()).expect("页面应当以 utf-8 编码")
+    }
+
+    /// 直接在仓储里造一个账号：不关心注册流程本身的用例走这条。
+    async fn add_user(store: &InMemoryLinkRepository, email: &str, access: Access) -> User {
+        <InMemoryLinkRepository as UserRepository>::create(
+            store,
+            &NewUser {
+                email: email.to_string(),
+                password: PASSWORD.to_string(),
+                display_name: None,
+            },
+            &format!("plain${PASSWORD}"),
+            access,
+        )
+        .await
+        .expect("user should be created")
+    }
+
+    /// 登录并取回可放进 `Cookie` 头的 `sl_session=...`。
+    ///
+    /// 用宏而不是函数：`test::call_service` 要求写出具体的 service 类型，
+    /// 那串泛型参数在调用处没有信息量。
+    macro_rules! sign_in {
+        ($app:expr, $email:expr) => {{
+            let request = test::TestRequest::post()
+                .uri("/auth/login")
+                .set_json(serde_json::json!({ "email": $email, "password": PASSWORD }))
+                .to_request();
+            let response = test::call_service($app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{} 应当能登录",
+                $email
+            );
+            session_cookie(&response)
+        }};
+    }
+
+    /// 状态页上的密码表单。
+    fn password_form(code: &str, password: &str) -> actix_web::test::TestRequest {
+        test::TestRequest::post()
+            .uri(&format!("/{code}"))
+            .insert_header((header::CONTENT_TYPE, "application/x-www-form-urlencoded"))
+            .set_payload(format!("password={password}"))
     }
 
     #[actix_web::test]
@@ -390,10 +479,9 @@ mod tests {
 
         let app = test::init_service(
             App::new()
-                .app_data(build_state_with(
+                .app_data(build_state(
                     store,
                     Arc::new(NoOpCounter),
-                    Some(ADMIN_TOKEN),
                     Arc::new(NoOpCache),
                     test_assets(),
                 ))
@@ -403,6 +491,215 @@ mod tests {
 
         let response = test::call_service(&app, get("/old").to_request()).await;
         assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(content_type(&response), Some("text/html; charset=utf-8"));
+
+        // 访客点开的是浏览器：给他一张说得清原因的页面，不是一段 JSON
+        let body = body_text(response).await;
+        assert!(body.contains("这条短链已经过期"), "{body}");
+        assert!(body.contains("<code>old</code>"));
+        assert!(!body.contains("<form"), "过期页不该要密码");
+    }
+
+    #[actix_web::test]
+    async fn rejects_exhausted_link_with_a_page() {
+        // 库里 visit_count 还是 0，上限 1，Redis 里已有 1 次未回刷：
+        // 判定必须立刻拒绝，页面也要说得清是「次数用完」而不是「过期」
+        let store = Arc::new(InMemoryLinkRepository::new());
+        store
+            .insert(
+                &crate::domain::new_link::NewShortLink {
+                    url: "https://example.com".into(),
+                    max_visits: Some(1),
+                    ..Default::default()
+                },
+                "lim",
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(build_state(
+                    store,
+                    Arc::new(RecordingCounter::with_pending("lim", 1)),
+                    Arc::new(NoOpCache),
+                    test_assets(),
+                ))
+                .configure(configure),
+        )
+        .await;
+
+        let response = test::call_service(&app, get("/lim").to_request()).await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(content_type(&response), Some("text/html; charset=utf-8"));
+
+        let body = body_text(response).await;
+        assert!(body.contains("访问次数已达上限"), "{body}");
+    }
+
+    #[actix_web::test]
+    async fn missing_code_gets_a_page_too() {
+        // 短码打错是常事，404 也该有页面，而不是把访客留在 JSON 里
+        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+
+        let response = test::call_service(&app, get("/typo").to_request()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(content_type(&response), Some("text/html; charset=utf-8"));
+
+        let body = body_text(response).await;
+        assert!(body.contains("没有找到这个短码"), "{body}");
+    }
+
+    #[actix_web::test]
+    async fn password_gate_renders_a_form_and_accepts_a_post() {
+        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+
+        post_shorten!(
+            &app,
+            serde_json::json!({
+                "url": "https://example.com/x",
+                "custom_code": "vault2",
+                "password": "s3cret"
+            })
+        );
+
+        // 1. 没带密码：给输入框，而不是只有一句 403
+        let required = test::call_service(&app, get("/vault2").to_request()).await;
+        assert_eq!(required.status(), StatusCode::FORBIDDEN);
+        assert_eq!(content_type(&required), Some("text/html; charset=utf-8"));
+        let body = body_text(required).await;
+        assert!(body.contains("请输入访问密码"), "{body}");
+        assert!(body.contains("name=\"password\""));
+        assert!(body.contains("method=\"post\""), "密码不能拼进 URL");
+
+        // 2. 密码错了：同一页，换成「再试一次」的文案
+        let rejected =
+            test::call_service(&app, password_form("vault2", "wrong").to_request()).await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        let body = body_text(rejected).await;
+        assert!(body.contains("密码不正确"), "{body}");
+        assert!(body.contains("<form"), "错了要能接着试");
+
+        // 3. 密码对了：303 换回 GET 再走目标地址
+        let accepted =
+            test::call_service(&app, password_form("vault2", "s3cret").to_request()).await;
+        assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            accepted
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://example.com/x")
+        );
+    }
+
+    #[actix_web::test]
+    async fn empty_password_field_counts_as_missing() {
+        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+
+        post_shorten!(
+            &app,
+            serde_json::json!({
+                "url": "https://example.com/x",
+                "custom_code": "vault3",
+                "password": "s3cret"
+            })
+        );
+
+        let response = test::call_service(&app, password_form("vault3", "").to_request()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = body_text(response).await;
+        assert!(
+            body.contains("请输入访问密码"),
+            "空串是「没填」，不该报成「密码不正确」：{body}"
+        );
+    }
+
+    /// 从中转页里取出「继续访问」的地址。
+    fn confirm_link(body: &str, code: &str) -> String {
+        let needle = format!("href=\"/{code}?confirm=");
+        let start = body
+            .find(&needle)
+            .unwrap_or_else(|| panic!("中转页应给出带票据的继续地址：{body}"))
+            + "href=\"".len();
+        let rest = &body[start..];
+        let end = rest.find('"').expect("href 必须有闭合引号");
+        rest[..end].to_string()
+    }
+
+    #[actix_web::test]
+    async fn interstitial_page_counts_only_after_continue() {
+        let counter = Arc::new(RecordingCounter::new());
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(
+                    Arc::new(InMemoryLinkRepository::new()),
+                    counter.clone(),
+                    Arc::new(NoOpCache),
+                ))
+                .configure(configure),
+        )
+        .await;
+
+        post_shorten!(
+            &app,
+            serde_json::json!({
+                "url": "https://example.com/gate",
+                "custom_code": "gate",
+                "interstitial": true
+            })
+        );
+
+        // 1. 打开确认页：什么都不发生，次数不动
+        let page = test::call_service(&app, get("/gate").to_request()).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let body = body_text(page).await;
+        let confirm = confirm_link(&body, "gate");
+        assert_eq!(counter.increments_of("gate"), 0, "打开中转页不该计次");
+
+        // 2. 点「继续访问」：这一跳才算一次
+        let jumped = test::call_service(&app, get(&confirm).to_request()).await;
+        assert_eq!(jumped.status(), StatusCode::FOUND);
+        assert_eq!(
+            jumped
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://example.com/gate")
+        );
+        assert_eq!(counter.increments_of("gate"), 1);
+
+        // 3. 票据是一次性的：重放同一张只会退回确认页，不再计次
+        let replay = test::call_service(&app, get(&confirm).to_request()).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            counter.increments_of("gate"),
+            1,
+            "用过或伪造的票据不能跳转，也不能计数"
+        );
+    }
+
+    #[actix_web::test]
+    async fn forged_confirm_ticket_does_not_bypass_the_password() {
+        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+
+        post_shorten!(
+            &app,
+            serde_json::json!({
+                "url": "https://example.com/secret",
+                "custom_code": "vault4",
+                "password": "s3cret",
+                "interstitial": true
+            })
+        );
+
+        // 手写一个 confirm 参数，换不来一次跳转：票据是服务端签发的，不是请求里说了算
+        let response = test::call_service(&app, get("/vault4?confirm=whatever").to_request()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = body_text(response).await;
+        assert!(body.contains("请输入访问密码"));
     }
 
     #[actix_web::test]
@@ -475,9 +772,10 @@ mod tests {
         // 用 RecordingCounter 让「未回刷增量」真实生效，库里的 visit_count 仍是 0
         let app = test::init_service(
             App::new()
-                .app_data(state_with(
+                .app_data(state_of(
+                    Arc::new(InMemoryLinkRepository::new()),
                     Arc::new(RecordingCounter::new()),
-                    Some(ADMIN_TOKEN),
+                    Arc::new(NoOpCache),
                 ))
                 .configure(configure),
         )
@@ -514,119 +812,581 @@ mod tests {
             .and_then(|value| value.to_str().ok())
     }
 
-    fn admin_get(uri: &str) -> actix_web::test::TestRequest {
-        test::TestRequest::get()
-            .uri(uri)
-            .insert_header((header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}")))
+    /// 一个「已经可以正常使用」的管理员访问级别（不强制改密）。
+    fn admin_access() -> Access {
+        Access {
+            role: Role::Admin,
+            must_change_password: false,
+        }
+    }
+
+    fn now_well_formed_token() -> String {
+        // 会话令牌在查库前先做格式校验，随便一串会被直接当成「没登录」
+        "a".repeat(64)
     }
 
     #[actix_web::test]
-    async fn admin_page_is_served() {
+    async fn console_api_requires_a_session() {
         let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
 
-        let response = test::call_service(&app, get("/admin").to_request()).await;
+        for uri in [
+            "/console/api/links",
+            "/console/api/overview",
+            "/admin/api/users",
+        ] {
+            let response = test::call_service(&app, get(uri).to_request()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{uri} 应要求登录"
+            );
+        }
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(content_type(&response), Some("text/html; charset=utf-8"));
+        let bogus = format!("sl_session={}", now_well_formed_token());
+        let response = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &bogus).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[actix_web::test]
-    async fn admin_page_wins_over_the_catch_all_route() {
-        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+    async fn users_only_see_and_delete_their_own_links() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, "alice@example.com", Access::USER).await;
+        add_user(&store, "bob@example.com", Access::USER).await;
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
 
-        let response = test::call_service(&app, get("/admin").to_request()).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(
+                    store.clone(),
+                    Arc::new(NoOpCounter),
+                    Arc::new(NoOpCache),
+                ))
+                .configure(configure),
+        )
+        .await;
 
-        let body = test::read_body(response).await;
-        let html = std::str::from_utf8(&body).expect("后台页应为 utf-8");
-        assert!(html.contains("admin.js"), "返回的应是后台页面");
+        let alice = sign_in!(&app, "alice@example.com");
+        post_shorten_as!(
+            &app,
+            &alice,
+            serde_json::json!({ "url": "https://example.com/a", "custom_code": "mine" })
+        );
+
+        let bob = sign_in!(&app, "bob@example.com");
+        post_shorten_as!(
+            &app,
+            &bob,
+            serde_json::json!({ "url": "https://example.com/b", "custom_code": "theirs" })
+        );
+
+        let listed = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &alice).to_request(),
+        )
+        .await;
+        assert_eq!(listed.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(listed).await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["items"][0]["code"], "mine");
+        assert!(
+            body["items"][0]["owner"].is_null(),
+            "普通用户不需要看到归属列"
+        );
+
+        // 别人的短码：删除一律 404，不区分「不是你的」和「不存在」
+        let refused = test::call_service(
+            &app,
+            with_cookie("DELETE", "/console/api/links/theirs", &alice).to_request(),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        // 管理员看全站，并带上归属
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+        let all = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &admin).to_request(),
+        )
+        .await;
+        let body: serde_json::Value = test::read_body_json(all).await;
+        assert_eq!(body["total"], 2);
+        let owner_of_bob = body["items"]
+            .as_array()
+            .expect("items should be an array")
+            .iter()
+            .find(|item| item["code"] == "theirs")
+            .expect("bob 的链接应在列表里")
+            .pointer("/owner/email")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        assert_eq!(owner_of_bob.as_deref(), Some("bob@example.com"));
+
+        // 管理员可以删别人的链接
+        let removed = test::call_service(
+            &app,
+            with_cookie("DELETE", "/console/api/links/theirs", &admin).to_request(),
+        )
+        .await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+        assert!(store.find_by_code("theirs").await.unwrap().is_none());
     }
 
     #[actix_web::test]
-    async fn admin_api_rejects_missing_or_wrong_token() {
-        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+    async fn user_management_is_admin_only() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, "alice@example.com", Access::USER).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
 
-        let missing = test::call_service(&app, get("/admin/api/links").to_request()).await;
-        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let alice = sign_in!(&app, "alice@example.com");
+        let response = test::call_service(
+            &app,
+            with_cookie("GET", "/admin/api/users", &alice).to_request(),
+        )
+        .await;
 
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["message"], "administrator privileges required");
+    }
+
+    #[actix_web::test]
+    async fn temporary_password_must_be_changed_before_the_console_opens() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, ADMIN_EMAIL, Access::ADMIN_WITH_TEMP_PASSWORD).await;
+        let password_file = temp_password_file("initial");
+        let app = test::init_service(
+            App::new()
+                .app_data(build_state_with(
+                    store,
+                    Arc::new(NoOpCounter),
+                    Arc::new(NoOpCache),
+                    test_assets(),
+                    Some(password_file.clone()),
+                ))
+                .configure(configure),
+        )
+        .await;
+
+        // 初始口令能登录，但只能用来改密码
+        let temporary = sign_in!(&app, ADMIN_EMAIL);
+        let blocked = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &temporary).to_request(),
+        )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = test::read_body_json(blocked).await;
+        assert_eq!(
+            body["message"],
+            "password must be changed before continuing"
+        );
+        assert!(
+            password_file.exists(),
+            "还没改密，文件仍是有效凭据，不能提前删"
+        );
+
+        // 当前口令不对
         let wrong = test::call_service(
             &app,
-            test::TestRequest::get()
-                .uri("/admin/api/links")
-                .insert_header((header::AUTHORIZATION, "Bearer nope"))
+            with_cookie("POST", "/auth/password", &temporary)
+                .set_json(serde_json::json!({
+                    "current_password": "nope",
+                    "new_password": "brandnew123"
+                }))
                 .to_request(),
         )
         .await;
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
-        // 不是 Bearer 的方案同样不放行
-        let basic = test::call_service(
+        // 太短
+        let weak = test::call_service(
             &app,
-            test::TestRequest::get()
-                .uri("/admin/api/links")
-                .insert_header((header::AUTHORIZATION, "Basic dGVzdA=="))
+            with_cookie("POST", "/auth/password", &temporary)
+                .set_json(serde_json::json!({
+                    "current_password": PASSWORD,
+                    "new_password": "short"
+                }))
                 .to_request(),
         )
         .await;
-        assert_eq!(basic.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(weak.status(), StatusCode::BAD_REQUEST);
+
+        // 改密成功：换发新 cookie，旧会话作废
+        let changed = test::call_service(
+            &app,
+            with_cookie("POST", "/auth/password", &temporary)
+                .set_json(serde_json::json!({
+                    "current_password": PASSWORD,
+                    "new_password": "brandnew123"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        let fresh = session_cookie(&changed);
+        let body: serde_json::Value = test::read_body_json(changed).await;
+        assert_eq!(body["user"]["must_change_password"], false);
+
+        let opened = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &fresh).to_request(),
+        )
+        .await;
+        assert_eq!(opened.status(), StatusCode::OK);
+
+        let stale = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &temporary).to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED, "旧会话应已失效");
+
+        // 之后只能用新口令登录
+        let with_old = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/auth/login")
+                .set_json(serde_json::json!({ "email": ADMIN_EMAIL, "password": PASSWORD }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(with_old.status(), StatusCode::UNAUTHORIZED);
+
+        let with_new = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/auth/login")
+                .set_json(serde_json::json!({ "email": ADMIN_EMAIL, "password": "brandnew123" }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(with_new.status(), StatusCode::OK);
+
+        // 一次性口令已经作废，文件留着只会让运维以为还能用
+        assert!(
+            !password_file.exists(),
+            "管理员改完初始口令后应立刻删除凭据文件"
+        );
+        let _ = std::fs::remove_dir_all(password_file.parent().unwrap());
     }
 
     #[actix_web::test]
-    async fn admin_api_is_404_when_disabled() {
+    async fn changing_a_reset_password_keeps_the_admin_credential_file() {
+        // 被管理员重置过的普通用户同样是「待改密」，但它的口令不在文件里。
+        // 清文件的条件必须同时看角色，否则随便一个普通用户改密就能把管理员凭据删掉。
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(
+            &store,
+            "bob@example.com",
+            Access {
+                role: Role::User,
+                must_change_password: true,
+            },
+        )
+        .await;
+        let password_file = temp_password_file("reset");
         let app = test::init_service(
             App::new()
-                .app_data(state_with(Arc::new(NoOpCounter), None))
+                .app_data(build_state_with(
+                    store,
+                    Arc::new(NoOpCounter),
+                    Arc::new(NoOpCache),
+                    test_assets(),
+                    Some(password_file.clone()),
+                ))
                 .configure(configure),
         )
         .await;
 
-        let response = test::call_service(&app, admin_get("/admin/api/links").to_request()).await;
-
-        // 未配置 ADMIN_TOKEN：连「存在后台」都不该暴露
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[actix_web::test]
-    async fn admin_lists_creates_and_deletes() {
-        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
-
-        post_shorten!(
+        let cookie = sign_in!(&app, "bob@example.com");
+        let changed = test::call_service(
             &app,
-            serde_json::json!({ "url": "https://example.com/a", "custom_code": "keep" })
-        );
-        post_shorten!(
-            &app,
-            serde_json::json!({ "url": "https://example.com/b", "custom_code": "drop" })
-        );
-
-        let listed = test::call_service(&app, admin_get("/admin/api/links").to_request()).await;
-        assert_eq!(listed.status(), StatusCode::OK);
-        let body: serde_json::Value = test::read_body_json(listed).await;
-        assert_eq!(body["total"], 2);
-        assert_eq!(body["items"].as_array().map(Vec::len), Some(2));
-        assert_eq!(body["page"], 1);
-        assert!(body["items"][0]["state"] == "active");
-
-        let deleted = test::call_service(
-            &app,
-            test::TestRequest::delete()
-                .uri("/admin/api/links/drop")
-                .insert_header((header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}")))
+            with_cookie("POST", "/auth/password", &cookie)
+                .set_json(serde_json::json!({
+                    "current_password": PASSWORD,
+                    "new_password": "brandnew123"
+                }))
                 .to_request(),
         )
         .await;
-        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert!(password_file.exists(), "普通用户改密不该动管理员的初始凭据");
 
-        let after: serde_json::Value = test::read_body_json(
-            test::call_service(&app, admin_get("/admin/api/links").to_request()).await,
+        let _ = std::fs::remove_dir_all(password_file.parent().unwrap());
+    }
+
+    #[actix_web::test]
+    async fn login_reports_the_role_and_status_the_console_branches_on() {
+        // 前端只看 `role === "admin"` 决定要不要显示用户页，
+        // 看 `must_change_password` 决定要不要挡在改密面板。这三个字段是契约。
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        add_user(&store, "plain@example.com", Access::USER).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
         )
         .await;
-        assert_eq!(after["total"], 1);
-        assert_eq!(after["items"][0]["code"], "keep");
 
-        // 删除后跳转应该 404，而不是继续 302
-        let redirect = test::call_service(&app, get("/drop").to_request()).await;
-        assert_eq!(redirect.status(), StatusCode::NOT_FOUND);
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+        let response =
+            test::call_service(&app, with_cookie("GET", "/auth/me", &admin).to_request()).await;
+        let body = body_json(response).await;
+        assert_eq!(body["user"]["role"], "admin");
+        assert_eq!(body["user"]["status"], "active");
+        assert_eq!(body["user"]["must_change_password"], false);
+
+        let plain = sign_in!(&app, "plain@example.com");
+        let response =
+            test::call_service(&app, with_cookie("GET", "/auth/me", &plain).to_request()).await;
+        let body = body_json(response).await;
+        assert_eq!(body["user"]["role"], "user");
+    }
+
+    #[actix_web::test]
+    async fn only_admins_see_who_owns_a_link() {
+        // 归属列只对管理员有意义；普通用户的行里 `owner` 必须是 null，
+        // 否则前端会画出「别人的邮箱」这种既没用又泄露信息的格子。
+        let store = Arc::new(InMemoryLinkRepository::new());
+        let alice = add_user(&store, "alice@example.com", Access::USER).await;
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        <InMemoryLinkRepository as LinkRepository>::insert(
+            &store,
+            &crate::domain::new_link::NewShortLink {
+                url: "https://example.com/alice".into(),
+                owner_id: Some(alice.id),
+                ..Default::default()
+            },
+            "mine",
+        )
+        .await
+        .expect("link should be inserted");
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
+
+        let plain = sign_in!(&app, "alice@example.com");
+        let response = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &plain).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["items"][0]["code"], "mine");
+        assert!(body["items"][0]["owner"].is_null(), "普通用户不该看到归属");
+
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+        let response = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &admin).to_request(),
+        )
+        .await;
+        let body = body_json(response).await;
+        assert_eq!(body["items"][0]["owner"]["email"], "alice@example.com");
+    }
+
+    #[actix_web::test]
+    async fn admin_can_reset_a_user_password() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        let alice = add_user(&store, "alice@example.com", Access::USER).await;
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
+
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+        let response = test::call_service(
+            &app,
+            with_cookie(
+                "POST",
+                &format!("/admin/api/users/{}/password", alice.id),
+                &admin,
+            )
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["email"], "alice@example.com");
+        let temporary = body["password"]
+            .as_str()
+            .expect("重置密码应返回一次性口令")
+            .to_string();
+        assert!(temporary.len() >= 8);
+
+        // 旧口令进不来
+        let old = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/auth/login")
+                .set_json(serde_json::json!({ "email": "alice@example.com", "password": PASSWORD }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(old.status(), StatusCode::UNAUTHORIZED);
+
+        // 临时口令能登录，但必须先改密
+        let login = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/auth/login")
+                .set_json(serde_json::json!({
+                    "email": "alice@example.com",
+                    "password": temporary
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(login).await;
+        assert_eq!(body["user"]["must_change_password"], true);
+    }
+
+    #[actix_web::test]
+    async fn disabling_a_user_takes_effect_immediately() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        let alice = add_user(&store, "alice@example.com", Access::USER).await;
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
+
+        let alice_cookie = sign_in!(&app, "alice@example.com");
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+
+        let disabled = test::call_service(
+            &app,
+            with_cookie(
+                "POST",
+                &format!("/admin/api/users/{}/status", alice.id),
+                &admin,
+            )
+            .set_json(serde_json::json!({ "status": "disabled" }))
+            .to_request(),
+        )
+        .await;
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(disabled).await;
+        assert_eq!(body["status"], "disabled");
+
+        // 已登录的会话立刻失效
+        let stale = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/links", &alice_cookie).to_request(),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+
+        // 再登录被告知账号已停用
+        let login = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/auth/login")
+                .set_json(serde_json::json!({ "email": "alice@example.com", "password": PASSWORD }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = test::read_body_json(login).await;
+        assert_eq!(body["message"], "account is disabled");
+
+        // 重新启用后恢复
+        let enabled = test::call_service(
+            &app,
+            with_cookie(
+                "POST",
+                &format!("/admin/api/users/{}/status", alice.id),
+                &admin,
+            )
+            .set_json(serde_json::json!({ "status": "active" }))
+            .to_request(),
+        )
+        .await;
+        assert_eq!(enabled.status(), StatusCode::OK);
+
+        let _ = sign_in!(&app, "alice@example.com");
+    }
+
+    #[actix_web::test]
+    async fn admin_cannot_disable_themselves() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        let admin = add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
+
+        let cookie = sign_in!(&app, ADMIN_EMAIL);
+        let response = test::call_service(
+            &app,
+            with_cookie(
+                "POST",
+                &format!("/admin/api/users/{}/status", admin.id),
+                &cookie,
+            )
+            .set_json(serde_json::json!({ "status": "disabled" }))
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["message"],
+            "cannot change the status of your own account"
+        );
+    }
+
+    #[actix_web::test]
+    async fn rejects_unknown_status_values() {
+        let store = Arc::new(InMemoryLinkRepository::new());
+        let alice = add_user(&store, "alice@example.com", Access::USER).await;
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
+
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+        let response = test::call_service(
+            &app,
+            with_cookie(
+                "POST",
+                &format!("/admin/api/users/{}/status", alice.id),
+                &admin,
+            )
+            // 拼错的状态不能被当成「禁用」：一次手滑不该停掉别人的号
+            .set_json(serde_json::json!({ "status": "deactivated" }))
+            .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// 创建接口下发的访客 cookie，取 `name=value` 部分。
@@ -753,19 +1513,24 @@ mod tests {
     #[actix_web::test]
     async fn recent_survives_the_cookie_but_not_the_link() {
         // 后台删掉短链后，历史里那条不能继续指向 404
-        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
 
         let cookie = visitor_cookie(&post_shorten!(
             &app,
             serde_json::json!({ "url": "https://example.com/x", "custom_code": "doomed" })
         ));
 
+        let admin = sign_in!(&app, ADMIN_EMAIL);
         test::call_service(
             &app,
-            test::TestRequest::delete()
-                .uri("/admin/api/links/doomed")
-                .insert_header((header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}")))
-                .to_request(),
+            with_cookie("DELETE", "/console/api/links/doomed", &admin).to_request(),
         )
         .await;
 
@@ -778,14 +1543,19 @@ mod tests {
 
     #[actix_web::test]
     async fn admin_delete_unknown_code_is_404() {
-        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
 
+        let admin = sign_in!(&app, ADMIN_EMAIL);
         let response = test::call_service(
             &app,
-            test::TestRequest::delete()
-                .uri("/admin/api/links/ghost")
-                .insert_header((header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}")))
-                .to_request(),
+            with_cookie("DELETE", "/console/api/links/ghost", &admin).to_request(),
         )
         .await;
 
@@ -807,13 +1577,11 @@ mod tests {
             },
         );
 
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
         let app = test::init_service(
             App::new()
-                .app_data(state_with_cache(
-                    Arc::new(NoOpCounter),
-                    Some(ADMIN_TOKEN),
-                    cache.clone(),
-                ))
+                .app_data(state_of(store, Arc::new(NoOpCounter), cache.clone()))
                 .configure(configure),
         )
         .await;
@@ -823,12 +1591,10 @@ mod tests {
             serde_json::json!({ "url": "https://example.com/cached", "custom_code": "cached" })
         );
 
+        let admin = sign_in!(&app, ADMIN_EMAIL);
         test::call_service(
             &app,
-            test::TestRequest::delete()
-                .uri("/admin/api/links/cached")
-                .insert_header((header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}")))
-                .to_request(),
+            with_cookie("DELETE", "/console/api/links/cached", &admin).to_request(),
         )
         .await;
 
@@ -837,7 +1603,14 @@ mod tests {
 
     #[actix_web::test]
     async fn admin_overview_reports_totals() {
-        let app = test::init_service(App::new().app_data(state()).configure(configure)).await;
+        let store = Arc::new(InMemoryLinkRepository::new());
+        add_user(&store, ADMIN_EMAIL, admin_access()).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state_of(store, Arc::new(NoOpCounter), Arc::new(NoOpCache)))
+                .configure(configure),
+        )
+        .await;
 
         post_shorten!(
             &app,
@@ -847,8 +1620,12 @@ mod tests {
         test::call_service(&app, get("/one").to_request()).await;
         test::call_service(&app, get("/one").to_request()).await;
 
-        let response =
-            test::call_service(&app, admin_get("/admin/api/overview").to_request()).await;
+        let admin = sign_in!(&app, ADMIN_EMAIL);
+        let response = test::call_service(
+            &app,
+            with_cookie("GET", "/console/api/overview", &admin).to_request(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let body: serde_json::Value = test::read_body_json(response).await;
@@ -964,6 +1741,7 @@ mod tests {
             "admin.html",
             "login.html",
             "interstitial.html",
+            "notice.html",
         ] {
             std::fs::write(root.join(page), "<html><body>page</body></html>").unwrap();
         }
@@ -976,8 +1754,8 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .app_data(build_state(
+                    Arc::new(InMemoryLinkRepository::new()),
                     Arc::new(NoOpCounter),
-                    Some(ADMIN_TOKEN),
                     Arc::new(NoOpCache),
                     assets,
                 ))

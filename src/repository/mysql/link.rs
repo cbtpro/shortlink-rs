@@ -59,7 +59,10 @@ const CLEAR_SQL: &str = "DELETE FROM link_creations WHERE visitor_id = ?";
 ///
 /// `SUM(布尔表达式)` 在 MySQL 里等价于计数；`CAST(... AS UNSIGNED)` 是为了让
 /// `DECIMAL` 能直接解码成 `u64`（聚合结果默认不是无符号整数）。
-const OVERVIEW_SQL: &str = "SELECT \
+///
+/// 归属过滤放在 `WHERE` 之前拼（见 [`overview_sql`]），保证「我的后台」看到的是
+/// 自己那几个数字，而不是全站汇总。
+const OVERVIEW_BODY: &str = "SELECT \
      CAST(COUNT(*) AS UNSIGNED) AS total_links, \
      CAST(COALESCE(SUM(visit_count), 0) AS UNSIGNED) AS total_visits, \
      CAST(COALESCE(SUM(created_at >= ?), 0) AS UNSIGNED) AS created_today, \
@@ -126,11 +129,18 @@ impl LinkRepository for MySqlLinkRepository {
         delta: u32,
     ) -> BoxFuture<'a, Result<(), RepoError>> {
         Box::pin(async move {
-            sqlx::query(ADD_VISITS_SQL)
+            let result = sqlx::query(ADD_VISITS_SQL)
                 .bind(delta)
                 .bind(code)
                 .execute(&self.pool)
                 .await?;
+
+            // UPDATE 不报「没这行」。不判影响行数的话，回刷任务会以为写成功了，
+            // 于是一边抵扣增量一边丢掉这段访问量，而且永远不会触发「链接已删除」的清理。
+            if result.rows_affected() == 0 {
+                return Err(RepoError::NotFound);
+            }
+
             Ok(())
         })
     }
@@ -158,6 +168,10 @@ impl LinkRepository for MySqlLinkRepository {
                 select = select.bind(pattern).bind(pattern);
                 count = count.bind(pattern).bind(pattern);
             }
+            if let Some(owner) = query.owner {
+                select = select.bind(owner);
+                count = count.bind(owner);
+            }
             if matches!(query.filter, LinkFilter::Active | LinkFilter::Expired) {
                 select = select.bind(now);
                 count = count.bind(now);
@@ -175,15 +189,27 @@ impl LinkRepository for MySqlLinkRepository {
         })
     }
 
-    fn overview(&self, window: OverviewWindow) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
+    fn overview(
+        &self,
+        window: OverviewWindow,
+        owner: Option<u64>,
+    ) -> BoxFuture<'_, Result<LinkOverview, RepoError>> {
         Box::pin(async move {
+            let sql = match owner {
+                Some(_) => format!("{OVERVIEW_BODY} WHERE user_id = ?"),
+                None => OVERVIEW_BODY.to_string(),
+            };
+
+            let mut query = sqlx::query_as::<_, (u64, u64, u64, u64)>(&sql)
+                .bind(window.today_start)
+                .bind(window.now)
+                .bind(window.expiring_before);
+            if let Some(owner) = owner {
+                query = query.bind(owner);
+            }
+
             let (total_links, total_visits, created_today, expiring_soon) =
-                sqlx::query_as::<_, (u64, u64, u64, u64)>(OVERVIEW_SQL)
-                    .bind(window.today_start)
-                    .bind(window.now)
-                    .bind(window.expiring_before)
-                    .fetch_one(&self.pool)
-                    .await?;
+                query.fetch_one(&self.pool).await?;
 
             Ok(LinkOverview {
                 total_links,
@@ -341,6 +367,11 @@ fn build_conditions(query: &LinkQuery) -> String {
         conditions.push_str(" AND (code LIKE ? OR long_url LIKE ?)");
     }
 
+    // 归属过滤排在关键字之后、状态之前：绑定顺序必须与 list() 一致
+    if query.owner.is_some() {
+        conditions.push_str(" AND user_id = ?");
+    }
+
     // 判定条件与 `ShortLink::state` 一一对应，改一处必须同步另一处
     conditions.push_str(match query.filter {
         LinkFilter::All => "",
@@ -358,7 +389,8 @@ fn build_conditions(query: &LinkQuery) -> String {
 /// 转义 `LIKE` 的通配符，避免用户输入 `%` 时全表匹配。
 ///
 /// MySQL 默认把反斜杠当转义符，所以这里只用反斜杠转义。
-fn like_pattern(keyword: &str) -> String {
+/// 对 `account` 模块可见：用户列表的关键字搜索用的是同一套规则。
+pub(super) fn like_pattern(keyword: &str) -> String {
     let escaped = keyword
         .replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -376,17 +408,23 @@ mod tests {
             page_size: 20,
             keyword: keyword.map(str::to_string),
             filter,
+            owner: None,
         }
     }
 
     #[test]
     fn conditions_follow_placeholder_order() {
-        // 顺序：keyword 两个 → filter 一个；绑定代码依赖这个顺序
-        let sql = build_conditions(&query(Some("abc"), LinkFilter::Active));
+        // 顺序：keyword 两个 → owner 一个 → filter 一个；绑定代码依赖这个顺序
+        let sql = build_conditions(&LinkQuery {
+            owner: Some(7),
+            ..query(Some("abc"), LinkFilter::Active)
+        });
         let code_pos = sql.find("code LIKE").expect("keyword clause");
+        let owner_pos = sql.find("user_id = ?").expect("owner clause");
         let filter_pos = sql.find("expire_at IS NULL").expect("filter clause");
-        assert!(code_pos < filter_pos);
-        assert_eq!(sql.matches('?').count(), 3);
+        assert!(code_pos < owner_pos, "归属条件要排在关键字之后");
+        assert!(owner_pos < filter_pos, "归属条件要排在状态之前");
+        assert_eq!(sql.matches('?').count(), 4);
     }
 
     #[test]

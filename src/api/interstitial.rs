@@ -1,18 +1,24 @@
 //! 中转页：把目标地址填进一张静态模板。
 //!
-//! 页面里没有脚本，点「继续访问」直接去目标站点：少一次往返，
-//! 目标地址也不必经过一个可被枚举的跳转端点。
+//! 页面里没有脚本。点「继续访问」会带着票据回到 `GET /{code}`，由服务端换一次
+//! 302 —— 中转页只是确认页，不算一次访问，这一跳才算。代价是比直连多一次往返，
+//! 换来的是计数口径与「访问者真的到达了」一致。
 
 use actix_web::http::header;
 use actix_web::HttpResponse;
 
+use crate::api::template::fill;
 use crate::assets::AssetServer;
 
 /// 中转页模板名，与 `web/` 下的文件对应。
 const TEMPLATE: &str = "interstitial.html";
 
-/// 渲染中转页。`target` 来自数据库，必须当作不可信输入处理。
-pub fn render(assets: &AssetServer, code: &str, target: &str) -> HttpResponse {
+/// 渲染中转页。
+///
+/// `target` 来自数据库，必须当作不可信输入处理；
+/// `continue_url` 是「继续访问」的目标 —— 通常是带票据的回跳地址，
+/// 只有访问者真的点下去，服务端才知道这次跳转发生了、才会计数。
+pub fn render(assets: &AssetServer, code: &str, target: &str, continue_url: &str) -> HttpResponse {
     let Some(template) = assets.get(TEMPLATE).and_then(|asset| asset.as_text()) else {
         // 启动时已校验模板存在，这里只可能是运行期被删
         log::error!("interstitial template `{TEMPLATE}` is missing");
@@ -21,7 +27,12 @@ pub fn render(assets: &AssetServer, code: &str, target: &str) -> HttpResponse {
 
     let body = fill(
         &template,
-        &[("code", code), ("host", host_of(target)), ("url", target)],
+        &[
+            ("code", code),
+            ("host", host_of(target)),
+            ("url", target),
+            ("next", continue_url),
+        ],
     );
 
     HttpResponse::Ok()
@@ -29,55 +40,6 @@ pub fn render(assets: &AssetServer, code: &str, target: &str) -> HttpResponse {
         .insert_header((header::CACHE_CONTROL, "no-store"))
         .content_type("text/html; charset=utf-8")
         .body(body)
-}
-
-/// 单遍替换 `{{name}}`，替换进来的值一律转义。
-///
-/// 单遍是必须的：若按占位符逐个 `replace`，先插入的值里如果含有另一个占位符，
-/// 就会被再展开一次。
-fn fill(template: &str, values: &[(&str, &str)]) -> String {
-    let mut out = String::with_capacity(template.len() + 128);
-    let mut rest = template;
-
-    while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
-
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("}}") else {
-            // 模板自身写错了：原样输出，不要在运行时悄悄吞掉
-            out.push_str(&rest[start..]);
-            return out;
-        };
-
-        match values.iter().find(|(name, _)| *name == &after[..end]) {
-            Some((_, value)) => out.push_str(&escape_html(value)),
-            None => {
-                out.push_str("{{");
-                out.push_str(&after[..end]);
-                out.push_str("}}");
-            }
-        }
-
-        rest = &after[end + 2..];
-    }
-
-    out.push_str(rest);
-    out
-}
-
-fn escape_html(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
 }
 
 /// 取展示用的主机名。取不到就退回整串，反正是当纯文本显示的。
@@ -90,39 +52,6 @@ fn host_of(url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn escapes_markup_in_values() {
-        let page = fill(
-            "<a href=\"{{url}}\">{{url}}</a>",
-            &[("url", "https://e.test/\"onmouseover=\"alert(1)")],
-        );
-
-        assert!(!page.contains("onmouseover=\"alert"), "属性必须被截断");
-        assert!(page.contains("&quot;onmouseover=&quot;alert(1)"));
-    }
-
-    #[test]
-    fn escapes_script_tags() {
-        let page = fill("{{url}}", &[("url", "<script>alert(1)</script>")]);
-        assert_eq!(page, "&lt;script&gt;alert(1)&lt;/script&gt;");
-    }
-
-    #[test]
-    fn inserts_each_value_once() {
-        // 值里若有另一个占位符，不能再被展开
-        let page = fill(
-            "{{code}}|{{url}}",
-            &[("code", "abc"), ("url", "https://e.test/{{code}}")],
-        );
-        assert_eq!(page, "abc|https://e.test/{{code}}");
-    }
-
-    #[test]
-    fn keeps_unknown_placeholders_visible() {
-        // 模板写错时留痕，而不是渲染出一个空字符串
-        assert_eq!(fill("[{{nope}}]", &[("code", "abc")]), "[{{nope}}]");
-    }
 
     #[test]
     fn takes_host_from_url() {
@@ -152,12 +81,23 @@ mod tests {
                 ("code", "abc"),
                 ("host", "example.com"),
                 ("url", "https://example.com/a"),
+                ("next", "/abc?confirm=deadbeef"),
             ],
         );
 
         assert!(page.contains("example.com"));
-        assert!(page.contains("href=\"https://example.com/a\""));
+        assert!(
+            page.contains("https://example.com/a"),
+            "目标地址仍要在页面上写清楚"
+        );
         assert!(page.contains("abc"));
         assert!(!page.contains("{{"), "不应残留未替换的占位符");
+
+        // 「继续访问」必须走带票据的回跳地址，直连目标就没法计数了
+        assert!(page.contains("href=\"/abc?confirm=deadbeef\""));
+        assert!(
+            !page.contains("href=\"https://example.com/a\""),
+            "继续访问不能直连目标：那样服务端就统计不到这次跳转"
+        );
     }
 }

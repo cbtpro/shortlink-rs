@@ -6,10 +6,16 @@ use std::time::Duration;
 use chrono::Utc;
 use log::warn;
 
-use crate::cache::{LinkCache, VisitCounter};
+use crate::cache::{GateTicket, LinkCache, VisitCounter};
 use crate::domain::short_link::{AccessPolicy, AccessRequest, CachedLink};
 use crate::error::AppError;
 use crate::repository::LinkRepository;
+
+/// 中转页「继续访问」票据的有效期。
+///
+/// 用户可能在确认页上读一读、想一想，给足十分钟；票据是一次性的，
+/// 过期的代价只是重新打开一次中转页。
+const CONFIRM_TICKET_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// 解析短码后的落地方式。
 ///
@@ -19,8 +25,15 @@ use crate::repository::LinkRepository;
 pub enum Landing {
     /// 直接 302 到目标
     Direct(String),
-    /// 先渲染中转确认页，再由页面上的一次点击进入目标
-    Interstitial(String),
+    /// 先渲染中转确认页，再由页面上的一次点击进入目标。
+    ///
+    /// `ticket` 是「继续访问」的凭据：中转页只是确认页，不算一次访问，
+    /// 点下去的那次跳转才算。`None` 表示票据仓库不可用（Redis 挂了），
+    /// 页面只能直连目标 —— 这一跳就统计不到了，属于可接受的降级。
+    Interstitial {
+        target: String,
+        ticket: Option<String>,
+    },
 }
 
 /// 一次解析的结果：目标地址、是否中转、访问策略。
@@ -34,6 +47,7 @@ pub struct RedirectService {
     repository: Arc<dyn LinkRepository>,
     cache: Arc<dyn LinkCache>,
     counter: Arc<dyn VisitCounter>,
+    tickets: Arc<dyn GateTicket>,
     cache_ttl: Duration,
 }
 
@@ -42,12 +56,14 @@ impl RedirectService {
         repository: Arc<dyn LinkRepository>,
         cache: Arc<dyn LinkCache>,
         counter: Arc<dyn VisitCounter>,
+        tickets: Arc<dyn GateTicket>,
         cache_ttl: Duration,
     ) -> Self {
         Self {
             repository,
             cache,
             counter,
+            tickets,
             cache_ttl,
         }
     }
@@ -56,27 +72,49 @@ impl RedirectService {
     pub async fn resolve(&self, code: &str, password: Option<&str>) -> Result<Landing, AppError> {
         let resolved = self.load(code).await?;
 
-        // 只有设了次数上限才需要读增量计数，避免缓存命中时多一次 Redis 往返
-        let pending_visits = if resolved.policy.requires_visit_count() {
-            self.pending_visits(code).await
-        } else {
-            0
-        };
         resolved.policy.check(&AccessRequest {
             // 与库中的 `expire_at` 同一基准：存储层一律 UTC
             now: Utc::now().naive_utc(),
             password,
-            pending_visits,
+            pending_visits: self.pending_visits(code, &resolved.policy).await,
+            authenticated: false,
         })?;
 
-        // 中转页打开就算一次访问：用户已经到达，是否点「继续访问」不再计一次
-        self.record_visit(code).await;
+        if resolved.interstitial {
+            // 中转页只是确认页：到这一步还不算「到达」。
+            // 发一张票据，等访问者真的点「继续访问」再计数。
+            return Ok(Landing::Interstitial {
+                target: resolved.long_url,
+                ticket: self.issue_ticket(code).await,
+            });
+        }
 
-        Ok(if resolved.interstitial {
-            Landing::Interstitial(resolved.long_url)
-        } else {
-            Landing::Direct(resolved.long_url)
-        })
+        self.record_visit(code).await;
+        Ok(Landing::Direct(resolved.long_url))
+    }
+
+    /// 中转页点「继续访问」：兑换票据、复检规则、计数、给出目标地址。
+    ///
+    /// 返回 `Ok(None)` 表示票据无效（过期、已用过、不是给这个短码签的），
+    /// 调用方应当回到完整的鉴权流程 —— 重新出密码页或中转页。
+    ///
+    /// 密码不再校验：票据只发给已经通过鉴权的请求。过期与次数上限仍要复检，
+    /// 因为访问者在确认页停留期间，链接可能刚好失效或名额被别人用完。
+    pub async fn confirm(&self, code: &str, ticket: &str) -> Result<Option<String>, AppError> {
+        if self.redeem_ticket(ticket).await.as_deref() != Some(code) {
+            return Ok(None);
+        }
+
+        let resolved = self.load(code).await?;
+        resolved.policy.check(&AccessRequest {
+            now: Utc::now().naive_utc(),
+            password: None,
+            pending_visits: self.pending_visits(code, &resolved.policy).await,
+            authenticated: true,
+        })?;
+
+        self.record_visit(code).await;
+        Ok(Some(resolved.long_url))
     }
 
     /// 先查缓存，未命中再回源并回填。
@@ -113,12 +151,39 @@ impl RedirectService {
         })
     }
 
-    async fn pending_visits(&self, code: &str) -> u32 {
+    /// 只有设了次数上限才需要读增量计数，避免缓存命中时多一次 Redis 往返。
+    async fn pending_visits(&self, code: &str, policy: &AccessPolicy) -> u32 {
+        if !policy.requires_visit_count() {
+            return 0;
+        }
+
         match self.counter.pending_of(code).await {
             Ok(count) => count,
             Err(err) => {
                 warn!("failed to read pending visits for `{code}`: {err}");
                 0
+            }
+        }
+    }
+
+    /// 发一张「继续访问」票据。拿不到就只能让页面直连目标，跳转不受影响。
+    async fn issue_ticket(&self, code: &str) -> Option<String> {
+        match self.tickets.issue(code, CONFIRM_TICKET_TTL).await {
+            Ok(ticket) => Some(ticket),
+            Err(err) => {
+                warn!("failed to issue a confirm ticket for `{code}`, the page will link straight to the target: {err}");
+                None
+            }
+        }
+    }
+
+    /// 兑换票据。仓库故障时当作「票据无效」，回落到完整鉴权流程。
+    async fn redeem_ticket(&self, ticket: &str) -> Option<String> {
+        match self.tickets.redeem(ticket).await {
+            Ok(code) => code,
+            Err(err) => {
+                warn!("failed to redeem a confirm ticket, falling back to the full check: {err}");
+                None
             }
         }
     }
@@ -137,8 +202,8 @@ mod tests {
     use crate::domain::new_link::NewShortLink;
     use crate::domain::short_link::AccessDenial;
     use crate::test_support::{
-        BrokenCache, BrokenCounter, InMemoryLinkRepository, NoOpCache, NoOpCounter, RecordingCache,
-        RecordingCounter,
+        BrokenCache, BrokenCounter, BrokenGateTicket, InMemoryGateTicket, InMemoryLinkRepository,
+        NoOpCache, NoOpCounter, RecordingCache, RecordingCounter,
     };
     use chrono::NaiveDate;
 
@@ -147,6 +212,7 @@ mod tests {
             repository,
             Arc::new(NoOpCache),
             Arc::new(NoOpCounter),
+            Arc::new(InMemoryGateTicket::new()),
             Duration::from_secs(60),
         )
     }
@@ -220,7 +286,21 @@ mod tests {
         cache: Arc<dyn LinkCache>,
         counter: Arc<dyn VisitCounter>,
     ) -> RedirectService {
-        RedirectService::new(repository, cache, counter, Duration::from_secs(60))
+        service_with_tickets(
+            repository,
+            cache,
+            counter,
+            Arc::new(InMemoryGateTicket::new()),
+        )
+    }
+
+    fn service_with_tickets(
+        repository: Arc<InMemoryLinkRepository>,
+        cache: Arc<dyn LinkCache>,
+        counter: Arc<dyn VisitCounter>,
+        tickets: Arc<dyn GateTicket>,
+    ) -> RedirectService {
+        RedirectService::new(repository, cache, counter, tickets, Duration::from_secs(60))
     }
 
     fn cached(long_url: &str) -> CachedLink {
@@ -239,6 +319,14 @@ mod tests {
         match landing {
             Landing::Direct(url) => url,
             other => panic!("expected a direct redirect, got {other:?}"),
+        }
+    }
+
+    /// 断言是中转，并取出目标地址与「继续访问」票据。
+    fn interstitial(landing: Landing) -> (String, Option<String>) {
+        match landing {
+            Landing::Interstitial { target, ticket } => (target, ticket),
+            other => panic!("expected an interstitial landing, got {other:?}"),
         }
     }
 
@@ -315,14 +403,144 @@ mod tests {
             .unwrap();
 
         let counter = Arc::new(RecordingCounter::new());
+        let tickets = Arc::new(InMemoryGateTicket::new());
+        let service = service_with_tickets(
+            repository,
+            Arc::new(NoOpCache),
+            counter.clone(),
+            tickets.clone(),
+        );
+
+        let (target, ticket) = interstitial(service.resolve("gate", None).await.unwrap());
+        assert_eq!(target, "https://example.com");
+        let ticket = ticket.expect("中转页要带上一张「继续访问」的票据");
+        assert_eq!(tickets.outstanding(), 1);
+
+        // 只打开确认页不算一次访问
+        assert_eq!(counter.increments_of("gate"), 0, "中转页不该消耗访问次数");
+
+        // 点了「继续访问」才计，且只计一次
+        assert_eq!(
+            service.confirm("gate", &ticket).await.unwrap().as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(counter.increments_of("gate"), 1);
+        assert_eq!(tickets.outstanding(), 0, "票据兑换后即失效");
+    }
+
+    #[tokio::test]
+    async fn tickets_are_single_use() {
+        let repository = Arc::new(InMemoryLinkRepository::new());
+        repository
+            .insert(&interstitial_link(), "gate")
+            .await
+            .unwrap();
+
+        let counter = Arc::new(RecordingCounter::new());
         let service = service_with_deps(repository, Arc::new(NoOpCache), counter.clone());
 
-        assert_eq!(
-            service.resolve("gate", None).await.unwrap(),
-            Landing::Interstitial("https://example.com".into())
+        let (_, ticket) = interstitial(service.resolve("gate", None).await.unwrap());
+        let ticket = ticket.unwrap();
+
+        assert!(service.confirm("gate", &ticket).await.unwrap().is_some());
+        assert!(
+            service.confirm("gate", &ticket).await.unwrap().is_none(),
+            "同一张票据不能重复兑换"
         );
-        // 打开中转页就算到达，点「继续访问」不再计一次
         assert_eq!(counter.increments_of("gate"), 1);
+    }
+
+    #[tokio::test]
+    async fn tickets_are_bound_to_their_code() {
+        // 拿 A 的票据去跳 B，等于绕过 B 的鉴权
+        let repository = Arc::new(InMemoryLinkRepository::new());
+        repository
+            .insert(&interstitial_link(), "gate")
+            .await
+            .unwrap();
+        repository
+            .insert(&interstitial_link(), "other")
+            .await
+            .unwrap();
+
+        let counter = Arc::new(RecordingCounter::new());
+        let service = service_with_deps(repository, Arc::new(NoOpCache), counter.clone());
+
+        let (_, ticket) = interstitial(service.resolve("gate", None).await.unwrap());
+
+        assert!(service
+            .confirm("other", &ticket.unwrap())
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(counter.increments_of("other"), 0);
+    }
+
+    #[tokio::test]
+    async fn confirm_skips_the_password_but_rechecks_the_rules() {
+        let repository = Arc::new(InMemoryLinkRepository::new());
+        let mut guarded = interstitial_link();
+        guarded.password = Some("secret".into());
+        guarded.max_visits = Some(2);
+        repository.insert(&guarded, "gate").await.unwrap();
+
+        let counter = Arc::new(RecordingCounter::new());
+        let service = service_with_deps(repository, Arc::new(NoOpCache), counter.clone());
+
+        // 输对密码才出中转页
+        let (_, ticket) = interstitial(
+            service
+                .resolve("gate", Some("secret"))
+                .await
+                .expect("correct password should pass"),
+        );
+
+        // 点「继续访问」时不再要密码：票据本身就是「已验过」的证明
+        assert!(service
+            .confirm("gate", &ticket.unwrap())
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(counter.increments_of("gate"), 1);
+
+        // 但次数上限照旧：中转页停留期间名额可能被用完了
+        let exhausted = Arc::new(InMemoryLinkRepository::new());
+        let mut capped = interstitial_link();
+        capped.max_visits = Some(1);
+        exhausted.insert(&capped, "cap").await.unwrap();
+
+        let service = service_with_tickets(
+            exhausted,
+            Arc::new(NoOpCache),
+            Arc::new(RecordingCounter::with_pending("cap", 1)),
+            Arc::new(InMemoryGateTicket::new()),
+        );
+        assert!(matches!(
+            service.resolve("cap", None).await,
+            Err(AppError::AccessDenied(AccessDenial::VisitLimitReached))
+        ));
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_a_direct_link_when_tickets_fail() {
+        // 票据仓库（Redis）挂了：中转页照样出，只是「继续访问」只能直连目标，
+        // 这一跳统计不到 —— 与「计数本身就在 Redis 里」的降级语义一致
+        let repository = Arc::new(InMemoryLinkRepository::new());
+        repository
+            .insert(&interstitial_link(), "gate")
+            .await
+            .unwrap();
+
+        let service = service_with_tickets(
+            repository,
+            Arc::new(NoOpCache),
+            Arc::new(NoOpCounter),
+            Arc::new(BrokenGateTicket),
+        );
+
+        let (target, ticket) = interstitial(service.resolve("gate", None).await.unwrap());
+        assert_eq!(target, "https://example.com");
+        assert!(ticket.is_none(), "发不出票据时页面应退回直连");
     }
 
     #[tokio::test]
@@ -339,10 +557,8 @@ mod tests {
             Arc::new(NoOpCounter),
         );
 
-        assert_eq!(
-            service.resolve("gate", None).await.unwrap(),
-            Landing::Interstitial("https://cached.example".into())
-        );
+        let (target, _) = interstitial(service.resolve("gate", None).await.unwrap());
+        assert_eq!(target, "https://cached.example");
     }
 
     #[tokio::test]
